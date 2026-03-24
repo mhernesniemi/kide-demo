@@ -8,8 +8,17 @@ export const resetUserCache = () => {
   hasUsers = null;
 };
 
+const DEMO_READ_ONLY = true;
+const READ_ONLY_MSG = "This is a read-only demo";
+
+const isFormRequest = (request: Request) => {
+  const ct = request.headers.get("content-type") ?? "";
+  return ct.includes("application/x-www-form-urlencoded") || ct.includes("multipart/form-data");
+};
+
 export const onRequest = defineMiddleware(async (context, next) => {
   const { pathname } = context.url;
+  const { method } = context.request;
 
   // Skip auth for public pages and static assets
   const isAdminRoute = pathname.startsWith("/admin");
@@ -23,6 +32,41 @@ export const onRequest = defineMiddleware(async (context, next) => {
 
   if (!isAdminRoute && !isAdminApiRoute) {
     return next();
+  }
+
+  // ── Read-only demo guard ────────────────────────────────────────────
+  if (DEMO_READ_ONLY) {
+    // Redirect login page → straight to admin
+    if (isLoginPage) {
+      return context.redirect("/admin");
+    }
+
+    // Logout → redirect to public site instead of login
+    if (pathname === "/api/cms/auth/logout") {
+      return new Response(null, { status: 303, headers: { Location: "/" } });
+    }
+
+    // Block all write API calls (except auth and locks)
+    if (isAdminApiRoute && method !== "GET") {
+      const isAuthRoute = pathname.startsWith("/api/cms/auth/");
+      const isLockRoute = pathname.startsWith("/api/cms/locks/");
+
+      if (!isAuthRoute && !isLockRoute) {
+        // Form submissions → redirect back with toast
+        if (isFormRequest(context.request)) {
+          const referer = context.request.headers.get("referer");
+          const redirectTo = referer ? new URL(referer).pathname : "/admin";
+          const sep = redirectTo.includes("?") ? "&" : "?";
+          return new Response(null, {
+            status: 303,
+            headers: { Location: `${redirectTo}${sep}_toast=error&_msg=${encodeURIComponent(READ_ONLY_MSG)}` },
+          });
+        }
+
+        // Fetch/JSON requests → 403 JSON
+        return Response.json({ error: READ_ONLY_MSG, readOnly: true }, { status: 403 });
+      }
+    }
   }
 
   // Check if any users exist (cached after first check)
@@ -66,6 +110,12 @@ export const onRequest = defineMiddleware(async (context, next) => {
   const user = await getSessionUser(context.request);
 
   if (!user) {
+    // In demo mode, inject a fake user so admin pages work without login
+    if (DEMO_READ_ONLY) {
+      context.locals.user = { id: "demo", email: "demo@example.com", name: "Demo User", role: "admin" };
+      return next();
+    }
+
     // API routes → 401
     if (isAdminApiRoute) {
       return new Response(JSON.stringify({ error: "Unauthorized" }), {
