@@ -329,6 +329,7 @@ export default function DocumentsDataTable({
       setActionError(null);
 
       try {
+        let readOnlyBlocked = false;
         await Promise.all(
           rows.map(async (row) => {
             // Extract collection slug from editHref (/admin/{slug}/{id})
@@ -346,10 +347,14 @@ export default function DocumentsDataTable({
             });
 
             if (!response.ok) {
+              const body = await response.json().catch(() => null);
+              if (body?.readOnly) { readOnlyBlocked = true; return; }
               throw new Error(`Failed to ${action} document.`);
             }
           }),
         );
+
+        if (readOnlyBlocked) return;
 
         if (isServerMode) {
           // Re-fetch current page after action
