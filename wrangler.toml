@@ -1,0 +1,16 @@
+name = "demo"
+compatibility_date = "2025-01-01"
+compatibility_flags = ["nodejs_compat"]
+
+[[d1_databases]]
+binding = "CMS_DB"
+database_name = "kide-demo-db"
+database_id = "6f5a993d-22ff-4ae5-b9a5-f19d67608df7" # Run: npx wrangler d1 create kide-demo-db
+
+[triggers]
+crons = ["* * * * *"]  # scheduled publishing — every minute
+
+[[r2_buckets]]
+binding = "CMS_ASSETS"
+bucket_name = "kide-demo-assets"
+# Run: npx wrangler r2 bucket create kide-demo-assets
