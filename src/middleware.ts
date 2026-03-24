@@ -49,9 +49,8 @@ export const onRequest = defineMiddleware(async (context, next) => {
     // Block all write API calls (except auth and locks)
     if (isAdminApiRoute && method !== "GET") {
       const isAuthRoute = pathname.startsWith("/api/cms/auth/");
-      const isLockRoute = pathname.startsWith("/api/cms/locks/");
 
-      if (!isAuthRoute && !isLockRoute) {
+      if (!isAuthRoute) {
         // Form submissions → redirect back with toast
         if (isFormRequest(context.request)) {
           const referer = context.request.headers.get("referer");
