@@ -1,8 +1,9 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { streamText } from "ai";
+import { env as cfEnv } from "cloudflare:workers";
 
-const env = (key: string) => import.meta.env[key];
+const env = (key: string) => (cfEnv as Record<string, string>)[key] ?? import.meta.env[key];
 
 export function isAiEnabled(): boolean {
   return !!(env("AI_PROVIDER") && env("AI_API_KEY"));

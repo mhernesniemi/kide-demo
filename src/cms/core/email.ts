@@ -1,8 +1,12 @@
+import { env as cfEnv } from "cloudflare:workers";
+
+const env = (key: string) => (cfEnv as Record<string, string>)[key] ?? import.meta.env[key];
+
 export const sendInviteEmail = async (to: string, inviteUrl: string): Promise<boolean> => {
-  const apiKey = import.meta.env.RESEND_API_KEY;
+  const apiKey = env("RESEND_API_KEY");
   if (!apiKey) return false;
 
-  const from = import.meta.env.RESEND_FROM_EMAIL ?? "Kide CMS <noreply@example.com>";
+  const from = env("RESEND_FROM_EMAIL") ?? "Kide CMS <noreply@example.com>";
 
   try {
     const res = await fetch("https://api.resend.com/emails", {
@@ -31,4 +35,4 @@ export const sendInviteEmail = async (to: string, inviteUrl: string): Promise<bo
   }
 };
 
-export const isEmailConfigured = (): boolean => !!import.meta.env.RESEND_API_KEY;
+export const isEmailConfigured = (): boolean => !!env("RESEND_API_KEY");
