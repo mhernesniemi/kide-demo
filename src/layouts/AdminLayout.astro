@@ -15,6 +15,7 @@ import {
   Users,
 } from "lucide-react";
 
+import { cmsImage } from "@/cms/core/image";
 import MobileSidebar from "@/components/admin/MobileSidebar";
 import SidebarUserMenu from "@/components/admin/SidebarUserMenu";
 import Toast from "@/components/admin/Toast.astro";
@@ -120,14 +121,10 @@ navItems.push({
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width" />
+    <meta name="cms-thumbnail" content={cmsImage("/uploads/_probe", 480)} />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <link rel="icon" href="/favicon.ico" />
     <title>{title}</title>
-    <script is:inline async src="https://plausible.io/js/pa-u1rTfh_e7B90HPDwQROk5.js"></script>
-    <script is:inline>
-      window.plausible=window.plausible||function(){(plausible.q=plausible.q||[]).push(arguments)},plausible.init=plausible.init||function(i){plausible.o=i||{}};
-      plausible.init()
-    </script>
     <script is:inline>
       if (!document.cookie.includes("tz="))
         document.cookie = "tz=" + Intl.DateTimeFormat().resolvedOptions().timeZone + ";path=/;max-age=31536000";
@@ -294,39 +291,6 @@ navItems.push({
           var el = document.getElementById("admin-toast");
           if (el) el.remove();
         }, delay);
-      })();
-    </script>
-
-    {/* Read-only demo: intercept fetch 403s and show toast */}
-    <script is:inline>
-      (function () {
-        var toastTimer;
-        function showDemoToast(msg) {
-          var existing = document.getElementById("demo-toast");
-          if (existing) existing.remove();
-          clearTimeout(toastTimer);
-          var wrapper = document.createElement("div");
-          wrapper.id = "demo-toast";
-          wrapper.className = "fixed top-4 left-1/2 z-50 w-full max-w-sm -translate-x-1/2";
-          wrapper.innerHTML =
-            '<div role="alert" class="bg-card flex items-center gap-2 rounded-lg border border-red-500/30 px-5 py-3 text-sm shadow-lg" style="animation:toast-in 0.25s ease-out,toast-out 0.3s ease-in 4.7s forwards">' +
-            '<svg class="size-4 shrink-0 text-red-600 dark:text-red-400" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>' +
-            '<span class="text-red-700 dark:text-red-400">' + msg + "</span></div>";
-          document.body.appendChild(wrapper);
-          toastTimer = setTimeout(function () { wrapper.remove(); }, 5200);
-        }
-
-        var origFetch = window.fetch;
-        window.fetch = function () {
-          return origFetch.apply(this, arguments).then(function (response) {
-            if (response.status === 403) {
-              response.clone().json().then(function (body) {
-                if (body && body.readOnly) showDemoToast(body.error || "This is a read-only demo");
-              }).catch(function () {});
-            }
-            return response;
-          });
-        };
       })();
     </script>
   </body>

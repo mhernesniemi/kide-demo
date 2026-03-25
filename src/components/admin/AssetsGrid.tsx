@@ -45,6 +45,7 @@ type AssetItem = {
   filename: string;
   mimeType: string;
   url: string;
+  thumbnail: string;
   alt: string | null;
   _createdAt: string;
 };
@@ -92,7 +93,12 @@ function DraggableAssetCard({
           <div className="relative">
             {asset.mimeType.startsWith("image/") ? (
               <div className="bg-muted/30 aspect-square w-full overflow-hidden">
-                <img src={asset.url} alt={asset.alt ?? asset.filename} className="size-full object-cover" />
+                <img
+                  src={asset.thumbnail}
+                  alt={asset.alt ?? asset.filename}
+                  className="size-full object-cover"
+                  loading="lazy"
+                />
               </div>
             ) : (
               <div className="bg-muted/30 flex aspect-square items-center justify-center">
@@ -242,7 +248,12 @@ function AssetDragOverlay({ asset }: { asset: AssetItem }) {
         <div className="relative">
           {asset.mimeType.startsWith("image/") ? (
             <div className="bg-muted/30 aspect-square w-full overflow-hidden">
-              <img src={asset.url} alt={asset.alt ?? asset.filename} className="size-full object-cover" />
+              <img
+                src={asset.thumbnail}
+                alt={asset.alt ?? asset.filename}
+                className="size-full object-cover"
+                loading="lazy"
+              />
             </div>
           ) : (
             <div className="bg-muted/30 flex aspect-square items-center justify-center">
