@@ -2,7 +2,6 @@
 import AssetsGrid from "@/components/admin/AssetsGrid";
 import config from "@/cms/cms.config";
 import { assets, folders } from "@/cms/core/assets";
-import { cmsImage } from "@/cms/core/image";
 import AdminLayout from "@/layouts/AdminLayout.astro";
 
 export const prerender = false;
@@ -43,7 +42,6 @@ const assetData = folderAssets.map((a) => ({
   filename: a.filename,
   mimeType: a.mimeType,
   url: a.url,
-  thumbnail: a.mimeType.startsWith("image/") ? cmsImage(a.url, 480) : a.url,
   alt: a.alt,
   _createdAt: a._createdAt,
 }));
