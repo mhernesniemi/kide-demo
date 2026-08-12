@@ -1,11 +1,16 @@
-import { eq, sql, and, or, desc, asc, lte, like } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, like, lte, ne, or, sql } from "drizzle-orm";
 import { nanoid } from "nanoid";
 
-import type { AccessConfig, CMSConfig, CollectionConfig, FieldConfig, HooksConfig, RichTextDocument } from "./define";
+import { recordAudit, type AuditActor } from "./audit";
+import { hashPassword, MIN_PASSWORD_LENGTH } from "./auth";
+import type { CMSConfig, CollectionConfig, FieldConfig, RichTextDocument } from "./define";
 import { getCollectionMap, getTranslatableFieldNames, isStructuralField } from "./define";
-import { getDb } from "./db";
-import { hashPassword } from "./auth";
+import { getDb, trackTask } from "./runtime";
+import { getSchema } from "./schema";
+import { indexDocument, isCollectionSearchable, removeDocument } from "./search";
+import { drainTasks, enqueueTask, pruneTasks, tickSchedules, type EnqueueTaskOptions } from "./tasks";
 import { cloneValue, createRichTextFromPlainText, slugify } from "./values";
+import { dispatchWebhooks } from "./webhooks";
 
 export type FindOptions = {
   where?: Record<string, unknown>;
@@ -25,11 +30,18 @@ type RuntimeContext = {
     id: string;
     role?: string;
     email?: string;
+    [key: string]: unknown;
   } | null;
   cache?: {
     invalidate: (opts: { tags: string[] }) => void | Promise<void>;
   };
+  /** Bypass access rules (server-side / migration / system operations). */
   _system?: boolean;
+  /**
+   * Skip the fire-and-forget search (re)indexing this operation would trigger.
+   * Useful for bulk imports — index once afterwards with `reindexAll()`.
+   */
+  _skipSearch?: boolean;
 };
 
 type CMSOperation = "read" | "create" | "update" | "delete" | "publish" | "schedule";
@@ -41,6 +53,7 @@ const pick = (input: Record<string, unknown>, keys: string[]) =>
 
 const isJsonField = (field: FieldConfig) =>
   field.type === "richText" ||
+  field.type === "content" ||
   field.type === "array" ||
   field.type === "json" ||
   field.type === "blocks" ||
@@ -49,7 +62,7 @@ const isJsonField = (field: FieldConfig) =>
 const ensureCollection = (config: CMSConfig, slug: string) => {
   const collection = getCollectionMap(config)[slug];
   if (!collection) {
-    const available = config.collections.map((c) => c.slug).join(", ");
+    const available = config.collections.map((collectionEntry) => collectionEntry.slug).join(", ");
     throw new Error(`Unknown collection "${slug}". Available collections: ${available}`);
   }
   return collection;
@@ -60,78 +73,94 @@ const getDefaultStatus = (collection: CollectionConfig) => (collection.drafts ? 
 const isEmptyValue = (value: unknown) =>
   value === undefined || value === null || value === "" || (Array.isArray(value) && value.length === 0);
 
+const coerceString = (value: unknown) => (value === null ? "" : String(value).trim());
+const coerceNumber = (value: unknown) => (value === "" || value === null ? undefined : Number(value));
+const coerceBoolean = (value: unknown) =>
+  value === true || value === "true" || value === "on" || value === 1 || value === "1";
+
+const coerceRelation = (field: FieldConfig, value: unknown) => {
+  if (!("hasMany" in field && field.hasMany)) return value ? String(value) : "";
+  if (Array.isArray(value)) return value.map((item) => String(item));
+
+  const stringValue = String(value).trim();
+  if (stringValue.startsWith("[")) {
+    try {
+      const parsed = JSON.parse(stringValue);
+      if (Array.isArray(parsed)) return parsed.map((item: unknown) => String(item)).filter(Boolean);
+    } catch {
+      // fall through to comma split
+    }
+  }
+
+  return stringValue
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+};
+
+const coerceArray = (value: unknown) => {
+  if (Array.isArray(value)) return value;
+  if (typeof value === "string") {
+    return value
+      .split(/\n|,/)
+      .map((item) => item.trim())
+      .filter(Boolean);
+  }
+  return [];
+};
+
+const coerceJsonOrBlocks = (field: FieldConfig, value: unknown) => {
+  const fallback = field.defaultValue ?? (field.type === "blocks" ? [] : {});
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    return trimmed ? JSON.parse(trimmed) : fallback;
+  }
+  return value ?? fallback;
+};
+
+const coerceRichText = (value: unknown) => {
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (trimmed.startsWith("{")) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        if (parsed?.type === "root") return parsed;
+      } catch {}
+    }
+    return createRichTextFromPlainText(value);
+  }
+  return (value as RichTextDocument | undefined) ?? createRichTextFromPlainText("");
+};
+
 const coerceFieldValue = (field: FieldConfig, value: unknown): unknown => {
   if (value === undefined) return undefined;
 
-  if (
-    field.type === "text" ||
-    field.type === "slug" ||
-    field.type === "email" ||
-    field.type === "image" ||
-    field.type === "date"
-  ) {
-    return value === null ? "" : String(value).trim();
+  switch (field.type) {
+    case "text":
+    case "slug":
+    case "email":
+    case "image":
+    case "date":
+      return coerceString(value);
+    case "number":
+      return coerceNumber(value);
+    case "boolean":
+      return coerceBoolean(value);
+    case "select":
+      return value === "" || value === null ? "" : String(value);
+    case "relation":
+      return coerceRelation(field, value);
+    case "array":
+      return coerceArray(value);
+    case "json":
+    case "blocks":
+      return coerceJsonOrBlocks(field, value);
+    case "richText":
+    case "content":
+      return coerceRichText(value);
+    default:
+      return value;
   }
-  if (field.type === "number") {
-    if (value === "" || value === null) return undefined;
-    return Number(value);
-  }
-  if (field.type === "boolean") {
-    return value === true || value === "true" || value === "on" || value === 1 || value === "1";
-  }
-  if (field.type === "select") {
-    return value === "" || value === null ? "" : String(value);
-  }
-  if (field.type === "relation") {
-    if (field.hasMany) {
-      if (Array.isArray(value)) return value.map((item) => String(item));
-      const str = String(value).trim();
-      if (str.startsWith("[")) {
-        try {
-          const parsed = JSON.parse(str);
-          if (Array.isArray(parsed)) return parsed.map((item: unknown) => String(item)).filter(Boolean);
-        } catch {
-          // fall through to comma split
-        }
-      }
-      return str
-        .split(",")
-        .map((item) => item.trim())
-        .filter(Boolean);
-    }
-    return value ? String(value) : "";
-  }
-  if (field.type === "array") {
-    if (Array.isArray(value)) return value;
-    if (typeof value === "string")
-      return value
-        .split(/\n|,/)
-        .map((item) => item.trim())
-        .filter(Boolean);
-    return [];
-  }
-  if (field.type === "json" || field.type === "blocks") {
-    if (typeof value === "string") {
-      const trimmed = value.trim();
-      if (!trimmed) return field.defaultValue ?? (field.type === "blocks" ? [] : {});
-      return JSON.parse(trimmed);
-    }
-    return value ?? field.defaultValue ?? (field.type === "blocks" ? [] : {});
-  }
-  if (field.type === "richText") {
-    if (typeof value === "string") {
-      const trimmed = value.trim();
-      if (trimmed.startsWith("{")) {
-        try {
-          const parsed = JSON.parse(trimmed);
-          if (parsed?.type === "root") return parsed;
-        } catch {}
-      }
-      return createRichTextFromPlainText(value);
-    }
-    return (value as RichTextDocument | undefined) ?? createRichTextFromPlainText("");
-  }
-  return value;
 };
 
 const prepareIncomingData = (
@@ -156,10 +185,10 @@ const prepareIncomingData = (
       }
       continue;
     }
+
     data[fieldName] = coercedValue;
   }
 
-  // Auto-generate slugs
   for (const [fieldName, field] of Object.entries(collection.fields)) {
     if (field.type !== "slug") continue;
     if (!isEmptyValue(data[fieldName])) {
@@ -171,31 +200,33 @@ const prepareIncomingData = (
     if (sourceValue) data[fieldName] = slugify(String(sourceValue));
   }
 
-  // Validate required
   for (const [fieldName, field] of Object.entries(collection.fields)) {
     if (!field.required) continue;
     const candidate = data[fieldName] ?? existing?.[fieldName];
     if (isEmptyValue(candidate)) throw new Error(`Field "${fieldName}" is required.`);
   }
 
+  for (const [fieldName, field] of Object.entries(collection.fields)) {
+    const maxItems = "maxItems" in field ? field.maxItems : undefined;
+    if (!maxItems) continue;
+    const candidate = data[fieldName] ?? existing?.[fieldName];
+    if (Array.isArray(candidate) && candidate.length > maxItems) {
+      throw new Error(`Field "${fieldName}" allows at most ${maxItems} item${maxItems === 1 ? "" : "s"}.`);
+    }
+  }
+
   return data;
 };
 
-// Serialize a JS document into DB column values
 const serializeForDb = (collection: CollectionConfig, data: Record<string, unknown>): Record<string, unknown> => {
   const result: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(data)) {
     const field = collection.fields[key];
-    if (field && isJsonField(field) && value !== undefined && value !== null) {
-      result[key] = JSON.stringify(value);
-    } else {
-      result[key] = value;
-    }
+    result[key] = field && isJsonField(field) && value !== undefined && value !== null ? JSON.stringify(value) : value;
   }
   return result;
 };
 
-// Deserialize DB row into JS document
 const deserializeFromDb = (collection: CollectionConfig, row: Record<string, unknown>): Record<string, unknown> => {
   const result: Record<string, unknown> = { ...row };
   for (const [key, field] of Object.entries(collection.fields)) {
@@ -210,18 +241,103 @@ const deserializeFromDb = (collection: CollectionConfig, row: Record<string, unk
   return result;
 };
 
+/** Auth collections are default-deny: admin-only, non-admins limited to their own row. */
+const defaultAuthAccess = (operation: CMSOperation, context: RuntimeContext, doc?: Record<string, unknown> | null) => {
+  const user = context.user;
+  if (!user) return false;
+  if (user.role === "admin") return true;
+  if (operation === "read" || operation === "update") return !!doc && doc._id === user.id;
+  return false;
+};
+
+/** Auth collections have an implicit read rule, so reads need per-document filtering. */
+const hasReadRule = (collection: CollectionConfig) => !!collection.access?.read || !!collection.auth;
+
 const canAccess = async (
-  access: AccessConfig | undefined,
   collection: CollectionConfig,
   operation: CMSOperation,
   context: RuntimeContext,
   doc?: Record<string, unknown> | null,
 ) => {
   if (context._system) return true;
-  const rule = access?.[collection.slug]?.[operation];
-  if (!rule) return true;
-  return rule({ user: context.user ?? null, doc: doc ?? null, operation, collection: collection.slug });
+  const rule = collection.access?.[operation];
+  if (rule) {
+    return rule({ user: context.user ?? null, doc: doc ?? null, operation, collection: collection.slug });
+  }
+  if (collection.auth) return defaultAuthAccess(operation, context, doc);
+  return true;
 };
+
+/** SQL predicate: another admin besides `excludeId` exists — for the atomic last-admin guards. */
+const anotherAdminExists = (mainTable: any, excludeId: string) =>
+  sql`EXISTS (SELECT 1 FROM ${mainTable} WHERE role = 'admin' AND _id != ${excludeId})`;
+
+/** Count admin rows in an auth collection's main table. */
+const countAdmins = async (db: any, mainTable: any): Promise<number> => {
+  const rows = await db.select({ _id: mainTable._id }).from(mainTable).where(eq(mainTable.role, "admin"));
+  return rows.length;
+};
+
+const canWriteAuthField = (fieldName: string, context: RuntimeContext, doc?: Record<string, unknown> | null) => {
+  const user = context.user;
+  if (user?.role === "admin") return true;
+  if (fieldName === "role") return false;
+  return !!user && !!doc && doc._id === user.id;
+};
+
+/** On create only `role` is privileged; a password on a new account escalates nothing. */
+const stripProtectedAuthFields = (
+  collection: CollectionConfig,
+  data: Record<string, unknown>,
+  context: RuntimeContext,
+  operation: "create" | "update",
+  doc?: Record<string, unknown> | null,
+) => {
+  if (!collection.auth || context._system) return;
+  const protectedFields = operation === "create" ? ["role"] : ["role", "password"];
+  for (const fieldName of protectedFields) {
+    if (data[fieldName] === undefined) continue;
+    if (collection.fields[fieldName]?.access?.update) continue;
+    if (!canWriteAuthField(fieldName, context, doc)) delete data[fieldName];
+  }
+};
+
+const stripUnwritableFields = async (
+  collection: CollectionConfig,
+  data: Record<string, unknown>,
+  context: RuntimeContext,
+  doc: Record<string, unknown> | null,
+) => {
+  if (context._system) return;
+  const operation = doc ? "update" : "create";
+  const accessCtx = { user: context.user ?? null, doc, operation, collection: collection.slug };
+  for (const [fieldName, field] of Object.entries(collection.fields)) {
+    if (!field.access?.update || data[fieldName] === undefined) continue;
+    if (!(await field.access.update(accessCtx))) delete data[fieldName];
+  }
+};
+
+/** Unreadable fields are omitted entirely, matching how `password` is handled. */
+const stripUnreadableFields = async (
+  collection: CollectionConfig,
+  doc: Record<string, unknown>,
+  context: RuntimeContext,
+) => {
+  if (context._system) return doc;
+  const accessCtx = { user: context.user ?? null, doc, operation: "read", collection: collection.slug };
+  let result = doc;
+  for (const [fieldName, field] of Object.entries(collection.fields)) {
+    if (!field.access?.read || !(fieldName in result)) continue;
+    if (!(await field.access.read(accessCtx))) {
+      if (result === doc) result = { ...doc };
+      delete result[fieldName];
+    }
+  }
+  return result;
+};
+
+const collectionHasFieldReadRules = (collection: CollectionConfig) =>
+  Object.values(collection.fields).some((field) => !!field.access?.read);
 
 const getHookContext = (collection: CollectionConfig, operation: string, context: RuntimeContext) => ({
   user: context.user ?? null,
@@ -231,19 +347,78 @@ const getHookContext = (collection: CollectionConfig, operation: string, context
   cache: context.cache,
 });
 
+const toAuditActor = (context: RuntimeContext): AuditActor => {
+  if (!context.user) return null;
+  return {
+    id: context.user.id,
+    email: context.user.email ?? "",
+    role: context.user.role ?? "",
+  };
+};
+
+const auditContent = (action: string, slug: string, resourceId: string, context: RuntimeContext) => {
+  trackTask(
+    recordAudit({
+      action,
+      resourceType: "content",
+      resourceCollection: slug,
+      resourceId,
+      actor: toAuditActor(context),
+    }),
+  );
+};
+
+const syncSearch = (config: CMSConfig, collection: CollectionConfig, docId: string) => {
+  if (!isCollectionSearchable(collection)) return;
+  const locales = config.locales?.supported ?? [];
+  trackTask(indexDocument(collection, docId, locales));
+};
+
+const removeSearch = (collection: CollectionConfig, docId: string) => {
+  if (!isCollectionSearchable(collection)) return;
+  trackTask(removeDocument(collection.slug, docId));
+};
+
+// Test-only: pauses update() before its role write, to force a concurrency test's interleaving.
+export const __testHooks = { beforeRoleWrite: null as null | (() => Promise<void>) };
+
 const getTableRefs = async (collectionSlug: string) => {
-  const schema = await import("../.generated/schema");
-  const tables = schema.cmsTables[collectionSlug as keyof typeof schema.cmsTables] as {
+  const tables = getSchema().cmsTables[collectionSlug] as {
     main: any;
     translations?: any;
     versions?: any;
   };
+
   if (!tables) throw new Error(`No tables found for collection "${collectionSlug}".`);
   return tables;
 };
 
-export const createCms = (config: CMSConfig, access?: AccessConfig, hooks?: HooksConfig) => {
+export const createCms = (config: CMSConfig) => {
+  // A partially-evaluated config here means a module cycle: cms.config.ts
+  // statically imported a module that itself imports the generated API (which
+  // imports cms.config.ts back). Fail with a diagnosis instead of a cryptic
+  // "reading 'collections'" crash at first use.
+  if (!config?.collections) {
+    throw new Error(
+      "createCms received an incomplete config — usually a module cycle: cms.config.ts statically imports " +
+        "a module that uses the generated cms API. Register such code lazily instead, e.g. " +
+        '"my.task": () => import("@/lib/handler").then((mod) => mod.run()).',
+    );
+  }
   const collectionMap = getCollectionMap(config);
+
+  // Webhook `name` routes deliveries — must be unique and non-empty.
+  const webhookNames = (config.admin?.webhooks ?? []).map((webhook) => webhook.name.trim());
+  if (webhookNames.some((name) => name === "")) {
+    throw new Error("A webhook in admin.webhooks has a blank name — names must be unique and non-empty.");
+  }
+  const seenWebhookNames = new Set<string>();
+  for (const name of webhookNames) {
+    if (seenWebhookNames.has(name)) {
+      throw new Error(`Duplicate webhook name "${name}" in admin.webhooks — names must be unique.`);
+    }
+    seenWebhookNames.add(name);
+  }
 
   const createCollectionApi = (slug: string) => {
     const collection = ensureCollection(config, slug);
@@ -255,10 +430,10 @@ export const createCms = (config: CMSConfig, access?: AccessConfig, hooks?: Hook
     ) => {
       const baseDoc = { ...doc };
       const translatableFields = getTranslatableFieldNames(collection);
-      const availableLocales = [...new Set(translations.map((t) => String(t._languageCode)))];
+      const availableLocales = [...new Set(translations.map((translation) => String(translation._languageCode)))];
 
       if (locale) {
-        const translation = translations.find((t) => t._languageCode === locale);
+        const translation = translations.find((entry) => entry._languageCode === locale);
         if (translation) {
           for (const fieldName of translatableFields) {
             if (translation[fieldName] !== undefined && translation[fieldName] !== null) {
@@ -281,34 +456,86 @@ export const createCms = (config: CMSConfig, access?: AccessConfig, hooks?: Hook
       return rest;
     };
 
+    const hasFieldReadRules = collectionHasFieldReadRules(collection);
+
+    /** Everything a document passes through on its way out of a read. */
+    const finalizeRead = async (doc: Record<string, unknown>, context: RuntimeContext) => {
+      const stripped = stripSensitiveFields(doc);
+      if (!hasFieldReadRules) return stripped;
+      return stripUnreadableFields(collection, stripped, context);
+    };
+
+    /** Read guard for the document-scoped reads that bypass `findById`. */
+    const assertReadable = async (id: string, context: RuntimeContext) => {
+      if (context._system) return;
+      const db = await getDb();
+      const tables = await getTableRefs(slug);
+      const rows = await db.select().from(tables.main).where(eq(tables.main._id, id)).limit(1);
+      if (rows.length === 0) return;
+      const doc = deserializeFromDb(collection, rows[0] as Record<string, unknown>);
+      if (!(await canAccess(collection, "read", context, doc))) {
+        throw new Error(`Access denied for ${collection.slug}.`);
+      }
+    };
+
+    const applyPublishedSnapshot = (row: Record<string, unknown>, status: FindOptions["status"]) => {
+      const doc = deserializeFromDb(collection, row);
+      if (status === "published" && typeof row._published === "string") {
+        try {
+          const snapshot = JSON.parse(row._published);
+          for (const key of Object.keys(collection.fields)) {
+            if (key in snapshot) doc[key] = snapshot[key];
+          }
+        } catch {}
+      }
+      return doc;
+    };
+
+    const filterReadableDocs = async (docs: Array<Record<string, unknown>>, context: RuntimeContext) => {
+      if (!hasReadRule(collection) || context._system) return docs;
+      const filtered: Array<Record<string, unknown>> = [];
+      for (const doc of docs) {
+        if (await canAccess(collection, "read", context, doc)) filtered.push(doc);
+      }
+      return filtered;
+    };
+
     return {
       async find(options: FindOptions = {}, context: RuntimeContext = {}) {
-        const allowed = await canAccess(access, collection, "read", context);
-        if (!allowed) throw new Error(`Access denied for ${collection.slug}.`);
-
         const db = await getDb();
         const tables = await getTableRefs(slug);
         const status = options.status ?? (collection.drafts ? "published" : "any");
+        const filterAfterReadAccess = hasReadRule(collection) && !context._system;
 
-        // Build conditions
         const conditions: any[] = [];
         if (status !== "any" && collection.drafts) {
           conditions.push(eq(tables.main._status, status));
         }
         if (options.where) {
+          const translatableFields = new Set(getTranslatableFieldNames(collection));
           for (const [key, value] of Object.entries(options.where)) {
-            if (key in tables.main) {
+            if (!(key in tables.main)) continue;
+            if (options.locale && tables.translations && translatableFields.has(key)) {
+              // Translatable fields live in the translations table for non-default
+              // locales: match the effective (overlaid) value — the translation when
+              // one exists for this locale, the main-table value otherwise. Without
+              // this, e.g. findOne({ slug, locale: "en" }) can never match a
+              // translated slug.
+              const tr = tables.translations;
+              conditions.push(
+                sql`(EXISTS (SELECT 1 FROM ${tr} WHERE ${tr._entityId} = ${tables.main._id} AND ${tr._languageCode} = ${options.locale} AND ${tr[key]} = ${value}) OR (${tables.main[key]} = ${value} AND NOT EXISTS (SELECT 1 FROM ${tr} WHERE ${tr._entityId} = ${tables.main._id} AND ${tr._languageCode} = ${options.locale} AND ${tr[key]} IS NOT NULL)))`,
+              );
+            } else {
               conditions.push(eq(tables.main[key], value));
             }
           }
         }
 
-        // Text search across searchable fields
         if (options.search?.trim()) {
           const searchTerm = `%${options.search.trim().toLowerCase()}%`;
           const searchableTypes = new Set(["text", "slug", "email", "select"]);
           const searchConditions = Object.entries(collection.fields)
-            .filter(([, f]) => searchableTypes.has(f.type))
+            .filter(([, field]) => searchableTypes.has(field.type))
             .filter(([name]) => name in tables.main)
             .map(([name]) => like(sql`lower(${tables.main[name]})`, searchTerm));
           if (searchConditions.length > 0) {
@@ -321,7 +548,6 @@ export const createCms = (config: CMSConfig, access?: AccessConfig, hooks?: Hook
           query = query.where(conditions.length === 1 ? conditions[0] : and(...conditions)) as any;
         }
 
-        // Sort
         if (options.sort) {
           const col = tables.main[options.sort.field];
           if (col) {
@@ -329,30 +555,24 @@ export const createCms = (config: CMSConfig, access?: AccessConfig, hooks?: Hook
           }
         }
 
-        // Pagination
-        if (options.limit) query = query.limit(options.limit) as any;
-        if (options.offset) query = query.offset(options.offset) as any;
+        if (!filterAfterReadAccess) {
+          if (options.limit) query = query.limit(options.limit) as any;
+          if (options.offset) query = query.offset(options.offset) as any;
+        }
 
         const rows = await query;
-
-        // Deserialize and overlay _published snapshot for public queries
-        const docs = rows.map((row: Record<string, unknown>) => {
-          const doc = deserializeFromDb(collection, row);
-          if (status === "published" && typeof row._published === "string") {
-            try {
-              const snapshot = JSON.parse(row._published);
-              for (const key of Object.keys(collection.fields)) {
-                if (key in snapshot) doc[key] = snapshot[key];
-              }
-            } catch {
-              /* ignore malformed snapshot */
-            }
-          }
-          return doc;
-        });
+        let docs = await filterReadableDocs(
+          rows.map((row: Record<string, unknown>) => applyPublishedSnapshot(row, status)),
+          context,
+        );
+        if (filterAfterReadAccess) {
+          const start = options.offset ?? 0;
+          const end = options.limit ? start + options.limit : undefined;
+          docs = docs.slice(start, end);
+        }
 
         if (tables.translations && (options.locale || config.locales)) {
-          const docIds = docs.map((d) => String(d._id));
+          const docIds = docs.map((doc: Record<string, unknown>) => String(doc._id));
           if (docIds.length > 0) {
             const allTranslations = await db
               .select()
@@ -364,33 +584,34 @@ export const createCms = (config: CMSConfig, access?: AccessConfig, hooks?: Hook
                 )})`,
               );
 
-            // Deserialize translation JSON fields
-            const parsedTranslations = allTranslations.map((t: Record<string, unknown>) => {
-              const parsed = { ...t };
+            const parsedTranslations = allTranslations.map((translation: Record<string, unknown>) => {
+              const parsed = { ...translation };
               const translatableFields = getTranslatableFieldNames(collection);
-              for (const fn of translatableFields) {
-                const field = collection.fields[fn];
-                if (isJsonField(field) && typeof parsed[fn] === "string") {
+              for (const fieldName of translatableFields) {
+                const field = collection.fields[fieldName];
+                if (isJsonField(field) && typeof parsed[fieldName] === "string") {
                   try {
-                    parsed[fn] = JSON.parse(parsed[fn] as string);
-                  } catch {
-                    /* keep string */
-                  }
+                    parsed[fieldName] = JSON.parse(parsed[fieldName] as string);
+                  } catch {}
                 }
               }
               return parsed;
             });
 
-            return docs.map((doc) => {
-              const docTranslations = parsedTranslations.filter(
-                (t: Record<string, unknown>) => t._entityId === doc._id,
-              );
-              return stripSensitiveFields(overlayLocale(doc, docTranslations, options.locale));
-            });
+            return Promise.all(
+              docs.map((doc: Record<string, unknown>) => {
+                const docTranslations = parsedTranslations.filter(
+                  (translation: Record<string, unknown>) => translation._entityId === doc._id,
+                );
+                return finalizeRead(overlayLocale(doc, docTranslations, options.locale), context);
+              }),
+            );
           }
         }
 
-        return docs.map((doc) => stripSensitiveFields(overlayLocale(doc, [], options.locale)));
+        return Promise.all(
+          docs.map((doc: Record<string, unknown>) => finalizeRead(overlayLocale(doc, [], options.locale), context)),
+        );
       },
 
       async findOne(
@@ -416,18 +637,14 @@ export const createCms = (config: CMSConfig, access?: AccessConfig, hooks?: Hook
       ) {
         const db = await getDb();
         const tables = await getTableRefs(slug);
-
         const rows = await db.select().from(tables.main).where(eq(tables.main._id, id)).limit(1);
         if (rows.length === 0) return null;
 
         const doc = deserializeFromDb(collection, rows[0] as Record<string, unknown>);
-
-        const allowed = await canAccess(access, collection, "read", context, doc);
+        const allowed = await canAccess(collection, "read", context, doc);
         if (!allowed) throw new Error(`Access denied for ${collection.slug}.`);
-
         if (options.status && options.status !== "any" && doc._status !== options.status) return null;
 
-        // Overlay _published snapshot for public queries
         const effectiveStatus = options.status ?? (collection.drafts ? "published" : "any");
         if (effectiveStatus === "published" && typeof (rows[0] as any)._published === "string") {
           try {
@@ -435,59 +652,57 @@ export const createCms = (config: CMSConfig, access?: AccessConfig, hooks?: Hook
             for (const key of Object.keys(collection.fields)) {
               if (key in snapshot) doc[key] = snapshot[key];
             }
-          } catch {
-            /* ignore */
-          }
+          } catch {}
         }
 
-        // Fetch translations
         let translations: Array<Record<string, unknown>> = [];
         if (tables.translations) {
           const rawTranslations = await db
             .select()
             .from(tables.translations)
             .where(eq(tables.translations._entityId, id));
-          translations = rawTranslations.map((t: Record<string, unknown>) => {
-            const parsed = { ...t };
-            for (const fn of getTranslatableFieldNames(collection)) {
-              const field = collection.fields[fn];
-              if (isJsonField(field) && typeof parsed[fn] === "string") {
+          translations = rawTranslations.map((translation: Record<string, unknown>) => {
+            const parsed = { ...translation };
+            for (const fieldName of getTranslatableFieldNames(collection)) {
+              const field = collection.fields[fieldName];
+              if (isJsonField(field) && typeof parsed[fieldName] === "string") {
                 try {
-                  parsed[fn] = JSON.parse(parsed[fn] as string);
-                } catch {
-                  /* keep string */
-                }
+                  parsed[fieldName] = JSON.parse(parsed[fieldName] as string);
+                } catch {}
               }
             }
             return parsed;
           });
         }
 
-        return stripSensitiveFields(overlayLocale(doc, translations, options.locale));
+        return finalizeRead(overlayLocale(doc, translations, options.locale), context);
       },
 
       async create(data: Record<string, unknown>, context: RuntimeContext = {}) {
-        const allowed = await canAccess(access, collection, "create", context);
+        const allowed = await canAccess(collection, "create", context);
         if (!allowed) throw new Error(`Access denied for ${collection.slug}.`);
+
+        stripProtectedAuthFields(collection, data, context, "create");
+        await stripUnwritableFields(collection, data, context, null);
 
         const db = await getDb();
         const tables = await getTableRefs(slug);
-
         const hookContext = getHookContext(collection, "create", context);
         const preparedInput = prepareIncomingData(collection, data, undefined);
 
-        // Hash password for auth collections
         if (collection.auth && typeof preparedInput.password === "string" && preparedInput.password) {
+          if (!context._system && preparedInput.password.length < MIN_PASSWORD_LENGTH) {
+            throw new Error(`Password must be at least ${MIN_PASSWORD_LENGTH} characters.`);
+          }
           preparedInput.password = await hashPassword(preparedInput.password);
         }
 
-        const transformedInput = hooks?.[collection.slug]?.beforeCreate
-          ? await hooks[collection.slug].beforeCreate!(preparedInput, hookContext)
+        const transformedInput = collection.hooks?.beforeCreate
+          ? await collection.hooks.beforeCreate(preparedInput, hookContext)
           : preparedInput;
 
         const createdAt = now();
         const docId = typeof data._id === "string" ? String(data._id) : nanoid();
-
         const docValues: Record<string, unknown> = {
           _id: docId,
           ...serializeForDb(collection, transformedInput),
@@ -505,7 +720,6 @@ export const createCms = (config: CMSConfig, access?: AccessConfig, hooks?: Hook
 
         await db.insert(tables.main).values(docValues);
 
-        // Save version
         if (collection.versions && tables.versions) {
           await db.insert(tables.versions).values({
             _id: nanoid(),
@@ -517,43 +731,69 @@ export const createCms = (config: CMSConfig, access?: AccessConfig, hooks?: Hook
         }
 
         const result = await this.findById(docId, {}, context);
-        await hooks?.[collection.slug]?.afterCreate?.(result!, hookContext);
+        await collection.hooks?.afterCreate?.(result!, hookContext);
+        auditContent("content.create", slug, docId, context);
+        if (!context._skipSearch) syncSearch(config, collection, docId);
+        dispatchWebhooks(config, "create", slug, result!, context.user);
         return result!;
+      },
+
+      // Create many documents sequentially (avoids DB write contention). Runs the
+      // full per-document path — hooks, versions, search, audit, webhooks.
+      async createMany(items: Array<Record<string, unknown>>, context: RuntimeContext = {}) {
+        const created: Record<string, unknown>[] = [];
+        for (const item of items) created.push(await this.create(item, context));
+        return created;
+      },
+
+      // Upsert by _id: update when a row with data._id already exists, else create.
+      // Pairs with create()'s caller-supplied _id to make imports idempotent
+      // (re-runnable) without a wipe-first step.
+      async upsert(data: Record<string, unknown>, context: RuntimeContext = {}) {
+        const id = typeof data._id === "string" && data._id ? data._id : undefined;
+        if (id) {
+          const db = await getDb();
+          const tables = await getTableRefs(slug);
+          const existing = await db
+            .select({ _id: tables.main._id })
+            .from(tables.main)
+            .where(eq(tables.main._id, id))
+            .limit(1);
+          if (existing.length) {
+            const { _id: _ignored, ...rest } = data;
+            return this.update(id, rest, context);
+          }
+        }
+        return this.create(data, context);
       },
 
       async update(id: string, data: Record<string, unknown>, context: RuntimeContext = {}) {
         const db = await getDb();
         const tables = await getTableRefs(slug);
-
         const existingRows = await db.select().from(tables.main).where(eq(tables.main._id, id)).limit(1);
         if (existingRows.length === 0) throw new Error(`${collection.labels.singular} not found.`);
 
         const existing = deserializeFromDb(collection, existingRows[0] as Record<string, unknown>);
-        const allowed = await canAccess(access, collection, "update", context, existing);
+        const allowed = await canAccess(collection, "update", context, existing);
         if (!allowed) throw new Error(`Access denied for ${collection.slug}.`);
 
-        // Field-level access: strip fields the user cannot update
-        const accessCtx = { user: context.user ?? null, doc: existing, operation: "update", collection: slug };
-        for (const [fieldName, field] of Object.entries(collection.fields)) {
-          if (field.access?.update && data[fieldName] !== undefined) {
-            const fieldAllowed = await field.access.update(accessCtx);
-            if (!fieldAllowed) delete data[fieldName];
-          }
-        }
+        stripProtectedAuthFields(collection, data, context, "update", existing);
+        await stripUnwritableFields(collection, data, context, existing);
 
         const hookContext = getHookContext(collection, "update", context);
         const preparedInput = prepareIncomingData(collection, data, undefined, existing);
 
-        // Hash password for auth collections (only if changed)
         if (collection.auth && typeof preparedInput.password === "string" && preparedInput.password) {
+          if (!context._system && preparedInput.password.length < MIN_PASSWORD_LENGTH) {
+            throw new Error(`Password must be at least ${MIN_PASSWORD_LENGTH} characters.`);
+          }
           preparedInput.password = await hashPassword(preparedInput.password);
         }
 
-        const transformedInput = hooks?.[collection.slug]?.beforeUpdate
-          ? await hooks[collection.slug].beforeUpdate!(preparedInput, existing, hookContext)
+        const transformedInput = collection.hooks?.beforeUpdate
+          ? await collection.hooks.beforeUpdate(preparedInput, existing, hookContext)
           : preparedInput;
 
-        // On first edit of a published doc, snapshot current content to _published
         if (collection.drafts && existing._status === "published" && !(existingRows[0] as any)._published) {
           const snapshot: Record<string, unknown> = {};
           for (const fieldName of Object.keys(collection.fields)) {
@@ -572,9 +812,25 @@ export const createCms = (config: CMSConfig, access?: AccessConfig, hooks?: Hook
           updateValues._updatedAt = now();
         }
 
-        await db.update(tables.main).set(updateValues).where(eq(tables.main._id, id));
+        // Guarded live via WHERE, not the stale `existing.role` — a role promoted after this
+        // row was read but before this statement runs must still be protected.
+        const writesNonAdminRole =
+          collection.auth &&
+          collection.fields.role &&
+          transformedInput.role !== undefined &&
+          transformedInput.role !== "admin";
+        if (__testHooks.beforeRoleWrite) await __testHooks.beforeRoleWrite();
+        if (writesNonAdminRole) {
+          const applied = await db
+            .update(tables.main)
+            .set(updateValues)
+            .where(and(eq(tables.main._id, id), or(ne(tables.main.role, "admin"), anotherAdminExists(tables.main, id))))
+            .returning({ _id: tables.main._id });
+          if (applied.length === 0) throw new Error("Cannot demote the last remaining admin.");
+        } else {
+          await db.update(tables.main).set(updateValues).where(eq(tables.main._id, id));
+        }
 
-        // Save version
         if (collection.versions && tables.versions) {
           const versionRows = await db
             .select({ maxVersion: sql<number>`coalesce(max(_version), 0)` })
@@ -591,7 +847,6 @@ export const createCms = (config: CMSConfig, access?: AccessConfig, hooks?: Hook
             _createdAt: now(),
           });
 
-          // Prune old versions
           if (maxVersions) {
             const allVersions = await db
               .select()
@@ -599,37 +854,146 @@ export const createCms = (config: CMSConfig, access?: AccessConfig, hooks?: Hook
               .where(eq(tables.versions._docId, id))
               .orderBy(desc(tables.versions._version));
             const toDelete = allVersions.slice(maxVersions);
-            for (const v of toDelete) {
-              await db.delete(tables.versions).where(eq(tables.versions._id, (v as any)._id));
+            for (const version of toDelete) {
+              await db.delete(tables.versions).where(eq(tables.versions._id, (version as any)._id));
             }
           }
         }
 
         const result = await this.findById(id, { status: "any" }, context);
-        await hooks?.[collection.slug]?.afterUpdate?.(result!, hookContext);
+        await collection.hooks?.afterUpdate?.(result!, hookContext);
+        auditContent("content.update", slug, id, context);
+        syncSearch(config, collection, id);
+        dispatchWebhooks(config, "update", slug, result!, context.user);
         return result!;
       },
 
-      async delete(id: string, context: RuntimeContext = {}) {
+      /** Returns true if a row was actually removed (false if not found, or blocked as the last admin). */
+      async delete(id: string, context: RuntimeContext = {}): Promise<boolean> {
         const db = await getDb();
         const tables = await getTableRefs(slug);
-
         const existingRows = await db.select().from(tables.main).where(eq(tables.main._id, id)).limit(1);
-        if (existingRows.length === 0) return;
+        if (existingRows.length === 0) return false;
 
         const existing = deserializeFromDb(collection, existingRows[0] as Record<string, unknown>);
-        const allowed = await canAccess(access, collection, "delete", context, existing);
+        const allowed = await canAccess(collection, "delete", context, existing);
         if (!allowed) throw new Error(`Access denied for ${collection.slug}.`);
 
         const hookContext = getHookContext(collection, "delete", context);
-        await hooks?.[collection.slug]?.beforeDelete?.(existing, hookContext);
+        await collection.hooks?.beforeDelete?.(existing, hookContext);
 
-        // Cascade via FK, but also explicitly for safety
+        // Guarded atomically: removed only if it isn't the sole admin.
+        if (collection.auth && collection.fields.role) {
+          const removed = await db
+            .delete(tables.main)
+            .where(and(eq(tables.main._id, id), or(ne(tables.main.role, "admin"), anotherAdminExists(tables.main, id))))
+            .returning({ _id: tables.main._id });
+          if (removed.length === 0) {
+            if (existing.role === "admin") throw new Error("Cannot delete the last remaining admin.");
+            return false; // concurrently removed
+          }
+        } else {
+          await db.delete(tables.main).where(eq(tables.main._id, id));
+        }
         if (tables.translations) await db.delete(tables.translations).where(eq(tables.translations._entityId, id));
         if (tables.versions) await db.delete(tables.versions).where(eq(tables.versions._docId, id));
-        await db.delete(tables.main).where(eq(tables.main._id, id));
 
-        await hooks?.[collection.slug]?.afterDelete?.(existing, hookContext);
+        await collection.hooks?.afterDelete?.(existing, hookContext);
+        auditContent("content.delete", slug, id, context);
+        removeSearch(collection, id);
+        // `existing` is the raw row; every other event dispatches the stripped findById result.
+        dispatchWebhooks(config, "delete", slug, stripSensitiveFields(existing), context.user);
+        return true;
+      },
+
+      /**
+       * Delete every document matching `filter` (equality on top-level columns;
+       * empty filter clears the whole collection), along with their translation,
+       * version and search-index rows. Returns the number of documents removed.
+       *
+       * Bulk path by design — per-document `beforeDelete`/`afterDelete` hooks and
+       * webhooks are NOT fired unless the collection defines delete hooks, in
+       * which case it falls back to the per-document `delete()` path. Intended for
+       * migrations/admin bulk actions; use `delete(id)` when you need full side
+       * effects on a single document.
+       */
+      async deleteMany(filter: Record<string, unknown> = {}, context: RuntimeContext = {}) {
+        const allowed = await canAccess(collection, "delete", context);
+        if (!allowed) throw new Error(`Access denied for ${collection.slug}.`);
+
+        const db = await getDb();
+        const tables = await getTableRefs(slug);
+
+        const conditions: any[] = [];
+        for (const [key, value] of Object.entries(filter)) {
+          if (key in tables.main) conditions.push(eq(tables.main[key], value));
+        }
+        let idQuery = db.select({ _id: tables.main._id }).from(tables.main);
+        if (conditions.length > 0) {
+          idQuery = idQuery.where(conditions.length === 1 ? conditions[0] : and(...conditions)) as any;
+        }
+        const ids: string[] = (await idQuery).map((row: { _id: string }) => String(row._id));
+        if (ids.length === 0) return 0;
+
+        const isAuthWithRole = !!(collection.auth && collection.fields.role);
+
+        // Non-authoritative early error for the common case — the real guard is per-row below.
+        if (isAuthWithRole) {
+          let adminsInSet = 0;
+          for (let i = 0; i < ids.length; i += 200) {
+            const chunk = ids.slice(i, i + 200);
+            const rows = await db
+              .select({ _id: tables.main._id })
+              .from(tables.main)
+              .where(and(eq(tables.main.role, "admin"), inArray(tables.main._id, chunk)));
+            adminsInSet += rows.length;
+          }
+          if (adminsInSet > 0 && (await countAdmins(db, tables.main)) - adminsInSet < 1) {
+            throw new Error("Cannot delete the last remaining admin.");
+          }
+        }
+
+        // Per-document path when delete hooks must run — this.delete() already carries the guard.
+        if (collection.hooks?.beforeDelete || collection.hooks?.afterDelete) {
+          let deleted = 0;
+          for (const id of ids) if (await this.delete(id, context)) deleted++;
+          return deleted;
+        }
+
+        let deletedIds: string[];
+        if (isAuthWithRole) {
+          // Every row goes through the same live-checked guard — no admin/non-admin bucketing,
+          // or a row promoted after `ids` was built would bulk-delete unconditionally.
+          deletedIds = [];
+          for (const id of ids) {
+            const removed = await db
+              .delete(tables.main)
+              .where(
+                and(eq(tables.main._id, id), or(ne(tables.main.role, "admin"), anotherAdminExists(tables.main, id))),
+              )
+              .returning({ _id: tables.main._id });
+            if (removed.length > 0) deletedIds.push(id);
+          }
+          for (const id of deletedIds) {
+            if (tables.translations) await db.delete(tables.translations).where(eq(tables.translations._entityId, id));
+            if (tables.versions) await db.delete(tables.versions).where(eq(tables.versions._docId, id));
+          }
+        } else {
+          const CHUNK = 200; // stay well under SQLite's bound-variable limit
+          for (let i = 0; i < ids.length; i += CHUNK) {
+            const chunk = ids.slice(i, i + CHUNK);
+            if (tables.translations)
+              await db.delete(tables.translations).where(inArray(tables.translations._entityId, chunk));
+            if (tables.versions) await db.delete(tables.versions).where(inArray(tables.versions._docId, chunk));
+            await db.delete(tables.main).where(inArray(tables.main._id, chunk));
+          }
+          deletedIds = ids;
+        }
+
+        if (!context._skipSearch) for (const id of deletedIds) removeSearch(collection, id);
+        auditContent("content.deleteMany", slug, `${deletedIds.length} document(s)`, context);
+        void context.cache?.invalidate({ tags: [slug] });
+        return deletedIds.length;
       },
 
       async publish(id: string, context: RuntimeContext = {}) {
@@ -637,17 +1001,16 @@ export const createCms = (config: CMSConfig, access?: AccessConfig, hooks?: Hook
 
         const db = await getDb();
         const tables = await getTableRefs(slug);
-
         const existingRows = await db.select().from(tables.main).where(eq(tables.main._id, id)).limit(1);
         if (existingRows.length === 0) throw new Error(`${collection.labels.singular} not found.`);
 
         const existing = deserializeFromDb(collection, existingRows[0] as Record<string, unknown>);
-        const allowed = await canAccess(access, collection, "publish", context, existing);
+        const allowed = await canAccess(collection, "publish", context, existing);
         if (!allowed) throw new Error(`Access denied for ${collection.slug}.`);
 
         const hookContext = getHookContext(collection, "publish", context);
-        if (hooks?.[collection.slug]?.beforePublish) {
-          await hooks[collection.slug].beforePublish!(existing, hookContext);
+        if (collection.hooks?.beforePublish) {
+          await collection.hooks.beforePublish(existing, hookContext);
         }
 
         const timestamp = now();
@@ -662,7 +1025,10 @@ export const createCms = (config: CMSConfig, access?: AccessConfig, hooks?: Hook
         await db.update(tables.main).set(updateValues).where(eq(tables.main._id, id));
 
         const result = await this.findById(id, { status: "any" }, context);
-        await hooks?.[collection.slug]?.afterPublish?.(result!, hookContext);
+        await collection.hooks?.afterPublish?.(result!, hookContext);
+        auditContent("content.publish", slug, id, context);
+        syncSearch(config, collection, id);
+        dispatchWebhooks(config, "publish", slug, result!, context.user);
         return result!;
       },
 
@@ -671,15 +1037,15 @@ export const createCms = (config: CMSConfig, access?: AccessConfig, hooks?: Hook
 
         const db = await getDb();
         const tables = await getTableRefs(slug);
-
         const existingRows = await db.select().from(tables.main).where(eq(tables.main._id, id)).limit(1);
         if (existingRows.length === 0) throw new Error(`${collection.labels.singular} not found.`);
 
         const existing = deserializeFromDb(collection, existingRows[0] as Record<string, unknown>);
-
+        const allowed = await canAccess(collection, "publish", context, existing);
+        if (!allowed) throw new Error(`Access denied for ${collection.slug}.`);
         const hookContext = getHookContext(collection, "unpublish", context);
-        if (hooks?.[collection.slug]?.beforeUnpublish) {
-          await hooks[collection.slug].beforeUnpublish!(existing, hookContext);
+        if (collection.hooks?.beforeUnpublish) {
+          await collection.hooks.beforeUnpublish(existing, hookContext);
         }
 
         const updateValues: Record<string, unknown> = {
@@ -693,7 +1059,10 @@ export const createCms = (config: CMSConfig, access?: AccessConfig, hooks?: Hook
         await db.update(tables.main).set(updateValues).where(eq(tables.main._id, id));
 
         const result = (await this.findById(id, { status: "any" }, context))!;
-        await hooks?.[collection.slug]?.afterUnpublish?.(result, hookContext);
+        await collection.hooks?.afterUnpublish?.(result, hookContext);
+        auditContent("content.unpublish", slug, id, context);
+        removeSearch(collection, id);
+        dispatchWebhooks(config, "unpublish", slug, result, context.user);
         return result;
       },
 
@@ -702,22 +1071,19 @@ export const createCms = (config: CMSConfig, access?: AccessConfig, hooks?: Hook
 
         const db = await getDb();
         const tables = await getTableRefs(slug);
-
         const existingRows = await db.select().from(tables.main).where(eq(tables.main._id, id)).limit(1);
         if (existingRows.length === 0) throw new Error(`${collection.labels.singular} not found.`);
 
         const existing = deserializeFromDb(collection, existingRows[0] as Record<string, unknown>);
-
-        // Check access: use "schedule" rule, fall back to "publish"
-        const scheduleAllowed = await canAccess(access, collection, "schedule", context, existing);
-        const publishAllowed = access?.[collection.slug]?.schedule
+        const scheduleAllowed = await canAccess(collection, "schedule", context, existing);
+        const publishAllowed = collection.access?.schedule
           ? scheduleAllowed
-          : await canAccess(access, collection, "publish", context, existing);
+          : await canAccess(collection, "publish", context, existing);
         if (!scheduleAllowed && !publishAllowed) throw new Error(`Access denied for ${collection.slug}.`);
 
         const hookContext = getHookContext(collection, "schedule", context);
-        if (hooks?.[collection.slug]?.beforeSchedule) {
-          await hooks[collection.slug].beforeSchedule!(existing, hookContext);
+        if (collection.hooks?.beforeSchedule) {
+          await collection.hooks.beforeSchedule(existing, hookContext);
         }
 
         const updateValues: Record<string, unknown> = {
@@ -729,7 +1095,9 @@ export const createCms = (config: CMSConfig, access?: AccessConfig, hooks?: Hook
         await db.update(tables.main).set(updateValues).where(eq(tables.main._id, id));
 
         const result = (await this.findById(id, { status: "any" }, context))!;
-        await hooks?.[collection.slug]?.afterSchedule?.(result, hookContext);
+        await collection.hooks?.afterSchedule?.(result, hookContext);
+        auditContent("content.schedule", slug, id, context);
+        removeSearch(collection, id);
         return result;
       },
 
@@ -738,18 +1106,16 @@ export const createCms = (config: CMSConfig, access?: AccessConfig, hooks?: Hook
 
         const db = await getDb();
         const tables = await getTableRefs(slug);
-
         const existingRows = await db.select().from(tables.main).where(eq(tables.main._id, id)).limit(1);
         if (existingRows.length === 0) throw new Error(`${collection.labels.singular} not found.`);
 
         const existing = deserializeFromDb(collection, existingRows[0] as Record<string, unknown>);
-        const allowed = await canAccess(access, collection, "update", context, existing);
+        const allowed = await canAccess(collection, "update", context, existing);
         if (!allowed) throw new Error(`Access denied for ${collection.slug}.`);
 
         const rawPublished = (existingRows[0] as any)._published;
         if (!rawPublished) return (await this.findById(id, { status: "any" }, context))!;
 
-        // Restore content fields from _published snapshot
         const snapshot = JSON.parse(rawPublished);
         const restoreValues: Record<string, unknown> = { _published: null };
         for (const [fieldName, field] of Object.entries(collection.fields)) {
@@ -762,14 +1128,10 @@ export const createCms = (config: CMSConfig, access?: AccessConfig, hooks?: Hook
         }
 
         await db.update(tables.main).set(restoreValues).where(eq(tables.main._id, id));
-
         return (await this.findById(id, { status: "any" }, context))!;
       },
 
       async count(filter: Omit<FindOptions, "limit" | "offset" | "sort"> = {}, context: RuntimeContext = {}) {
-        const allowed = await canAccess(access, collection, "read", context);
-        if (!allowed) throw new Error(`Access denied for ${collection.slug}.`);
-
         const db = await getDb();
         const tables = await getTableRefs(slug);
         const status = filter.status ?? (collection.drafts ? "published" : "any");
@@ -789,12 +1151,25 @@ export const createCms = (config: CMSConfig, access?: AccessConfig, hooks?: Hook
           const searchTerm = `%${filter.search.trim().toLowerCase()}%`;
           const searchableTypes = new Set(["text", "slug", "email", "select"]);
           const searchConditions = Object.entries(collection.fields)
-            .filter(([, f]) => searchableTypes.has(f.type))
+            .filter(([, field]) => searchableTypes.has(field.type))
             .filter(([name]) => name in tables.main)
             .map(([name]) => like(sql`lower(${tables.main[name]})`, searchTerm));
           if (searchConditions.length > 0) {
             conditions.push(or(...searchConditions)!);
           }
+        }
+
+        if (hasReadRule(collection) && !context._system) {
+          let rowsQuery = db.select().from(tables.main);
+          if (conditions.length > 0) {
+            rowsQuery = rowsQuery.where(conditions.length === 1 ? conditions[0] : and(...conditions)) as any;
+          }
+          const rows = await rowsQuery;
+          const docs = await filterReadableDocs(
+            rows.map((row: Record<string, unknown>) => applyPublishedSnapshot(row, status)),
+            context,
+          );
+          return docs.length;
         }
 
         let query = db.select({ total: sql<number>`count(*)` }).from(tables.main);
@@ -806,7 +1181,8 @@ export const createCms = (config: CMSConfig, access?: AccessConfig, hooks?: Hook
         return Number((result[0] as any)?.total ?? 0);
       },
 
-      async versions(id: string) {
+      async versions(id: string, context: RuntimeContext = {}) {
+        await assertReadable(id, context);
         const tables = await getTableRefs(slug);
         if (!tables.versions) return [];
         const db = await getDb();
@@ -815,21 +1191,26 @@ export const createCms = (config: CMSConfig, access?: AccessConfig, hooks?: Hook
           .from(tables.versions)
           .where(eq(tables.versions._docId, id))
           .orderBy(desc(tables.versions._version));
-        return rows.map((row: Record<string, unknown>) => ({
-          version: row._version as number,
-          createdAt: row._createdAt as string,
-          snapshot: typeof row._snapshot === "string" ? JSON.parse(row._snapshot) : row._snapshot,
-        }));
+        return rows.map((row: Record<string, unknown>) => {
+          const snapshot = typeof row._snapshot === "string" ? JSON.parse(row._snapshot) : row._snapshot;
+          return {
+            version: row._version as number,
+            createdAt: row._createdAt as string,
+            // Snapshots come from the raw row, so they carry the password hash.
+            snapshot: snapshot && typeof snapshot === "object" ? stripSensitiveFields(snapshot) : snapshot,
+          };
+        });
       },
 
       async restore(id: string, versionNumber: number, context: RuntimeContext = {}) {
         const versionList = await this.versions(id);
-        const version = versionList.find((v) => v.version === versionNumber);
+        const version = versionList.find((entry: { version: number }) => entry.version === versionNumber);
         if (!version) throw new Error(`Version ${versionNumber} not found.`);
         return this.update(id, version.snapshot, context);
       },
 
-      async getTranslations(id: string) {
+      async getTranslations(id: string, context: RuntimeContext = {}) {
+        await assertReadable(id, context);
         const tables = await getTableRefs(slug);
         if (!tables.translations) return {};
         const db = await getDb();
@@ -837,23 +1218,24 @@ export const createCms = (config: CMSConfig, access?: AccessConfig, hooks?: Hook
 
         const result: Record<string, Record<string, unknown>> = {};
         for (const row of rows) {
-          const r = row as Record<string, unknown>;
-          const locale = String(r._languageCode);
+          const translation = row as Record<string, unknown>;
+          const locale = String(translation._languageCode);
           const values: Record<string, unknown> = {};
-          for (const fn of getTranslatableFieldNames(collection)) {
-            const field = collection.fields[fn];
-            let val = r[fn];
-            if (isJsonField(field) && typeof val === "string") {
+
+          for (const fieldName of getTranslatableFieldNames(collection)) {
+            const field = collection.fields[fieldName];
+            let value = translation[fieldName];
+            if (isJsonField(field) && typeof value === "string") {
               try {
-                val = JSON.parse(val);
-              } catch {
-                /* keep string */
-              }
+                value = JSON.parse(value);
+              } catch {}
             }
-            values[fn] = val;
+            values[fieldName] = value;
           }
+
           result[locale] = values;
         }
+
         return result;
       },
 
@@ -866,15 +1248,19 @@ export const createCms = (config: CMSConfig, access?: AccessConfig, hooks?: Hook
         if (existingRows.length === 0) throw new Error(`${collection.labels.singular} not found.`);
 
         const existing = deserializeFromDb(collection, existingRows[0] as Record<string, unknown>);
-        const allowed = await canAccess(access, collection, "update", context, existing);
+        const allowed = await canAccess(collection, "update", context, existing);
         if (!allowed) throw new Error(`Access denied for ${collection.slug}.`);
 
         const translatableFields = getTranslatableFieldNames(collection);
         const translatedValues = prepareIncomingData(collection, data, locale, existing);
         const filtered = pick(translatedValues, translatableFields);
-        const serialized = serializeForDb(collection, filtered);
 
-        // Check if translation exists
+        const hookContext = getHookContext(collection, "update", context);
+        const transformedFiltered = collection.hooks?.beforeUpsertTranslation
+          ? await collection.hooks.beforeUpsertTranslation(filtered, locale, existing, hookContext)
+          : filtered;
+        const serialized = serializeForDb(collection, transformedFiltered);
+
         const existingTranslation = await db
           .select()
           .from(tables.translations)
@@ -895,12 +1281,10 @@ export const createCms = (config: CMSConfig, access?: AccessConfig, hooks?: Hook
           });
         }
 
-        // Update main doc timestamp
         if (collection.timestamps !== false) {
           await db.update(tables.main).set({ _updatedAt: now() }).where(eq(tables.main._id, id));
         }
 
-        // Save version
         if (collection.versions && tables.versions) {
           const versionRows = await db
             .select({ maxVersion: sql<number>`coalesce(max(_version), 0)` })
@@ -916,6 +1300,7 @@ export const createCms = (config: CMSConfig, access?: AccessConfig, hooks?: Hook
           });
         }
 
+        syncSearch(config, collection, id);
         return (await this.findById(id, { locale, status: "any" }, context))!;
       },
     };
@@ -965,7 +1350,6 @@ export const createCms = (config: CMSConfig, access?: AccessConfig, hooks?: Hook
           const collectionApiInstance = createCollectionApi(collection.slug);
           const ctx: RuntimeContext = { cache, _system: true };
 
-          // Publish scheduled docs whose _publishAt <= now
           const toPublish = await db
             .select()
             .from(tables.main)
@@ -977,7 +1361,6 @@ export const createCms = (config: CMSConfig, access?: AccessConfig, hooks?: Hook
             published++;
           }
 
-          // Unpublish published docs whose _unpublishAt <= now
           const toUnpublish = await db
             .select()
             .from(tables.main)
@@ -998,6 +1381,12 @@ export const createCms = (config: CMSConfig, access?: AccessConfig, hooks?: Hook
 
         return { published, unpublished };
       },
+    },
+    tasks: {
+      enqueue: (type: string, payload?: unknown, options?: EnqueueTaskOptions) => enqueueTask(type, payload, options),
+      drain: (limit?: number) => drainTasks(config, limit),
+      tick: () => tickSchedules(config),
+      prune: (olderThanMs?: number) => pruneTasks(olderThanMs),
     },
   };
 };

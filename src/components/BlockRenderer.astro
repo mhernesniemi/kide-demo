@@ -1,7 +1,11 @@
 ---
-import { renderBlock } from "../cms/core/blocks";
+import { cms } from "@/cms/.generated/api";
+import { SHARED_BLOCK_TYPE, isSharedBlockReference } from "@/cms/core";
 
-const { blocks = [] } = Astro.props as { blocks?: Array<Record<string, unknown>> };
+const { blocks = [], status = "published" } = Astro.props as {
+  blocks?: Array<Record<string, unknown>>;
+  status?: "published" | "any";
+};
 
 // Discover custom block components from src/components/blocks/
 const customComponents = import.meta.glob<{ default: any }>("./blocks/*.astro", { eager: true });
@@ -14,20 +18,69 @@ for (const [path, mod] of Object.entries(customComponents)) {
   const typeName = filename.charAt(0).toLowerCase() + filename.slice(1);
   componentMap[typeName] = mod.default;
 }
+
+const cmsRuntime = cms as Record<string, any>;
+const resolvedBlocks: Array<Record<string, unknown>> = [];
+for (const block of blocks) {
+  if (!isSharedBlockReference(block)) {
+    resolvedBlocks.push(block);
+    continue;
+  }
+
+  const shared = await cmsRuntime["shared-sections"]?.findById(block.ref, { status });
+  const sharedBlock = shared?.block;
+  if (sharedBlock && typeof sharedBlock === "object") {
+    resolvedBlocks.push({
+      ...(sharedBlock as Record<string, unknown>),
+      _sharedSection: {
+        id: block.ref,
+        title: shared.title,
+      },
+    });
+  } else if (status === "any") {
+    resolvedBlocks.push({
+      type: SHARED_BLOCK_TYPE,
+      ref: block.ref,
+      title: block.title ?? "Missing shared section",
+    });
+  }
+}
 ---
 
 <div class="flex flex-col gap-16">
   {
-    blocks.map((block) => {
+    resolvedBlocks.map((block) => {
       const type = String(block.type ?? "");
+      if (type === SHARED_BLOCK_TYPE) {
+        return (
+          <div class="rounded-lg border border-dashed border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+            Shared section is unavailable.
+          </div>
+        );
+      }
       const Component = componentMap[type];
 
-      if (Component) {
-        return <Component {...block} />;
+      if (!Component) {
+        // No component for this block type — degrade gracefully instead of
+        // crashing the page (e.g. partially-migrated content). Add
+        // src/components/blocks/<Type>.astro to render it.
+        if (import.meta.env.DEV) {
+          console.warn(
+            `[cms] No block component for type "${type}". Add src/components/blocks/${type.charAt(0).toUpperCase() + type.slice(1)}.astro`,
+          );
+          return (
+            <div
+              data-block-type={type}
+              class="rounded-lg border border-dashed border-gray-300 bg-gray-50 px-4 py-3 text-sm text-gray-500"
+            >
+              Unstyled block: <code>{type}</code>
+            </div>
+          );
+        }
+        return null;
       }
 
-      // Fall back to generic renderer
-      return <Fragment set:html={renderBlock(block)} />;
+      return <Component {...block} />;
     })
   }
 </div>

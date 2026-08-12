@@ -5,7 +5,7 @@ import tseslint from "typescript-eslint";
 
 export default tseslint.config(
   {
-    ignores: ["dist/", "src/cms/.generated/", ".astro/", "docs/", "packages/", "workers/"],
+    ignores: ["dist/", ".astro/", "docs/", "packages/", "workers/", "examples/**/.astro/", "examples/**/.generated/"],
   },
   js.configs.recommended,
   ...tseslint.configs.recommended,
@@ -26,6 +26,23 @@ export default tseslint.config(
     files: ["**/*.astro", "**/*.astro/*.ts"],
     rules: {
       "@typescript-eslint/no-unused-vars": "off",
+    },
+  },
+  {
+    // Standalone Node scripts (build/verify tooling).
+    files: ["scripts/**/*.mjs"],
+    languageOptions: {
+      globals: {
+        process: "readonly",
+        console: "readonly",
+        fetch: "readonly",
+        setTimeout: "readonly",
+        clearTimeout: "readonly",
+        URLSearchParams: "readonly",
+        URL: "readonly",
+        FormData: "readonly",
+        Blob: "readonly",
+      },
     },
   },
 );

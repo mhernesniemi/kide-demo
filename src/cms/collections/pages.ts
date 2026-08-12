@@ -1,4 +1,4 @@
-import { defineCollection, fields, hasRole } from "../core/define";
+import { defineCollection, fields, hasRole } from "@/cms/core";
 
 export default defineCollection({
   slug: "pages",
@@ -6,13 +6,14 @@ export default defineCollection({
   preview: true,
   timestamps: true,
   drafts: true,
+  searchable: true,
   versions: { max: 20 },
   views: {
     list: { columns: ["title", "_status", "_updatedAt"] },
   },
   fields: {
     title: fields.text({ required: true, translatable: true }),
-    slug: fields.slug({ from: "title", unique: true, translatable: true, admin: { position: "sidebar" } }),
+    slug: fields.slug({ from: "title", translatable: true, admin: { position: "sidebar" } }),
     summary: fields.text({
       translatable: true,
       admin: { rows: 3 },
@@ -34,7 +35,11 @@ export default defineCollection({
           content: fields.richText(),
         },
         image: {
-          images: fields.array({ of: fields.image(), defaultValue: [] }),
+          image: fields.image(),
+          caption: fields.text({ admin: { placeholder: "Optional caption" } }),
+        },
+        youtube: {
+          url: fields.text({ required: true, admin: { component: "youtube", placeholder: "Paste a YouTube URL" } }),
         },
         faq: {
           heading: fields.text(),
@@ -44,5 +49,16 @@ export default defineCollection({
         },
       },
     }),
+  },
+  hooks: {
+    afterPublish(doc, context) {
+      context.cache?.invalidate({ tags: ["pages", "home", `page:${doc._id}`] });
+    },
+    afterUpdate(doc, context) {
+      context.cache?.invalidate({ tags: ["pages", `page:${doc._id}`] });
+    },
+    afterDelete(doc, context) {
+      context.cache?.invalidate({ tags: ["pages", "home", `page:${doc._id}`] });
+    },
   },
 });

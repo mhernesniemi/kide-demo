@@ -3,7 +3,6 @@ import "@/styles/public.css";
 import { cms } from "@/cms/.generated/api";
 
 const { title = "Kide CMS", description = "A code-first CMS built inside Astro." } = Astro.props;
-
 type MenuItem = { id: string; label?: string; href?: string; target?: string; children: MenuItem[] };
 
 const menu = await cms.menus.findOne({ slug: "main" });
@@ -42,12 +41,13 @@ const menuItems: MenuItem[] = menu?.items ? (Array.isArray(menu.items) ? menu.it
           </nav>
         )
       }
+      <a
+        href="/admin"
+        class="ml-auto rounded-md border border-teal-700 px-3 py-1.5 text-sm font-medium text-teal-700 no-underline transition-colors hover:bg-teal-50"
+      >
+        Open admin
+      </a>
     </header>
     <slot />
-    <script is:inline async src="https://plausible.io/js/pa-u1rTfh_e7B90HPDwQROk5.js"></script>
-    <script is:inline>
-      window.plausible=window.plausible||function(){(plausible.q=plausible.q||[]).push(arguments)},plausible.init=plausible.init||function(i){plausible.o=i||{}};
-      plausible.init()
-    </script>
   </body>
 </html>

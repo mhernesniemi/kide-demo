@@ -2,10 +2,14 @@
 dist/
 # generated types
 .astro/
-src/cms/.generated/
+.generated/
+# generated wrapper CSS
+.kide/
 
 # dependencies
 node_modules/
+
+.pnpm-store/
 
 # logs
 npm-debug.log*
@@ -29,7 +33,9 @@ public/uploads/
 # jetbrains setting folder
 .idea/
 .cms-cache/
-.claude/
-
-# Cloudflare
+# Ignore local Claude settings, but keep committed agent skills (e.g. /migrate).
+.claude/*
+!.claude/skills/
+MODEL.md
 .wrangler/
+*.tgz

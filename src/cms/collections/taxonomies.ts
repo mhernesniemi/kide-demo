@@ -1,4 +1,4 @@
-import { defineCollection, fields } from "../core/define";
+import { defineCollection, fields } from "@/cms/core";
 
 export default defineCollection({
   slug: "taxonomies",
@@ -9,7 +9,7 @@ export default defineCollection({
   },
   fields: {
     name: fields.text({ required: true }),
-    slug: fields.slug({ from: "name", unique: true, admin: { position: "sidebar" } }),
+    slug: fields.slug({ from: "name", admin: { position: "sidebar" } }),
     terms: fields.json({
       translatable: true,
       admin: { component: "taxonomy-terms" },

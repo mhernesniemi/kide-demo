@@ -1,4 +1,4 @@
-import { defineCollection, fields } from "../core/define";
+import { contentToPlainText, defineCollection, fields } from "@/cms/core";
 
 export default defineCollection({
   slug: "posts",
@@ -6,9 +6,10 @@ export default defineCollection({
   pathPrefix: "blog",
   timestamps: true,
   drafts: true,
+  searchable: true,
   versions: { max: 20 },
   views: {
-    list: { columns: ["title", "category", "_status", "_updatedAt"] },
+    list: { columns: ["title", "_status", "_updatedAt"] },
   },
   fields: {
     title: fields.text({
@@ -16,14 +17,33 @@ export default defineCollection({
       indexed: true,
       translatable: true,
     }),
-    slug: fields.slug({ from: "title", unique: true, translatable: true, admin: { position: "sidebar" } }),
+    slug: fields.slug({ from: "title", translatable: true, admin: { position: "sidebar" } }),
     excerpt: fields.text({
       maxLength: 300,
       translatable: true,
       admin: { rows: 3 },
     }),
     image: fields.image(),
-    body: fields.richText({ translatable: true, admin: { rows: 14 } }),
+    body: fields.content({
+      translatable: true,
+      admin: { rows: 14 },
+      fullscreen: true,
+      blocks: {
+        faq: {
+          heading: fields.text(),
+          items: fields.json({
+            admin: { component: "repeater", help: "Add question and answer pairs" },
+          }),
+        },
+        image: {
+          image: fields.image(),
+          caption: fields.text({ admin: { placeholder: "Optional caption" } }),
+        },
+        youtube: {
+          url: fields.text({ required: true, admin: { component: "youtube", placeholder: "Paste a YouTube URL" } }),
+        },
+      },
+    }),
     category: fields.text({
       admin: { component: "taxonomy-select", placeholder: "categories", position: "sidebar" },
     }),
@@ -33,5 +53,23 @@ export default defineCollection({
       translatable: true,
       admin: { rows: 3, help: "Meta description for search engines. Max 160 characters.", position: "sidebar" },
     }),
+  },
+  hooks: {
+    beforeCreate(data) {
+      if (!data.excerpt && typeof data.body === "object" && data.body) {
+        const text = contentToPlainText(data.body as never);
+        if (text) data.excerpt = text.slice(0, 180);
+      }
+      return data;
+    },
+    afterPublish(doc, context) {
+      context.cache?.invalidate({ tags: ["posts", "home", `post:${doc._id}`] });
+    },
+    afterUpdate(doc, context) {
+      context.cache?.invalidate({ tags: ["posts", `post:${doc._id}`] });
+    },
+    afterDelete(doc, context) {
+      context.cache?.invalidate({ tags: ["posts", "home", `post:${doc._id}`] });
+    },
   },
 });

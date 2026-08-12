@@ -1,10 +1,16 @@
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 
-import config from "../cms.config";
-import { getTranslatableFieldNames, type CollectionConfig, type FieldConfig } from "./define";
+import type { CMSConfig, CollectionConfig, FieldConfig } from "./define";
+import { getTranslatableFieldNames } from "./define";
 
-const generatedDir = path.join(process.cwd(), "src/cms/.generated");
+type GeneratorOptions = {
+  outputDir: string;
+  coreImportPath?: string;
+  runtimeImportPath?: string;
+  configImportPath?: string;
+};
 
 const pascalCase = (value: string) =>
   value
@@ -21,14 +27,11 @@ const snakeCase = (value: string) =>
 
 const isJsonField = (field: FieldConfig) =>
   field.type === "richText" ||
+  field.type === "content" ||
   field.type === "array" ||
   field.type === "json" ||
   field.type === "blocks" ||
   (field.type === "relation" && field.hasMany);
-
-// ---------------------
-// schema.ts generation
-// ---------------------
 
 const generateColumnDef = (fieldName: string, field: FieldConfig): string => {
   const colName = snakeCase(fieldName);
@@ -45,9 +48,7 @@ const generateColumnDef = (fieldName: string, field: FieldConfig): string => {
   if (field.required && !field.condition) col += ".notNull()";
   if (field.unique) col += ".unique()";
   if (field.defaultValue !== undefined && !isJsonField(field)) {
-    if (field.type === "number") {
-      col += `.default(${field.defaultValue})`;
-    } else if (field.type === "boolean") {
+    if (field.type === "number" || field.type === "boolean") {
       col += `.default(${field.defaultValue})`;
     } else {
       col += `.default(${JSON.stringify(field.defaultValue)})`;
@@ -82,7 +83,7 @@ const generateMainTable = (collection: CollectionConfig): string => {
   return `export const ${varName} = sqliteTable("${tableName}", {\n${columns.join("\n")}\n});`;
 };
 
-const generateTranslationsTable = (collection: CollectionConfig): string | null => {
+const generateTranslationsTable = (config: CMSConfig, collection: CollectionConfig): string | null => {
   if (!config.locales) return null;
   const translatableFields = getTranslatableFieldNames(collection);
   if (translatableFields.length === 0) return null;
@@ -98,8 +99,7 @@ const generateTranslationsTable = (collection: CollectionConfig): string | null 
   ];
 
   for (const fieldName of translatableFields) {
-    const field = collection.fields[fieldName];
-    columns.push(generateColumnDef(fieldName, field));
+    columns.push(generateColumnDef(fieldName, collection.fields[fieldName]));
   }
 
   return `export const ${varName} = sqliteTable("${tableName}", {\n${columns.join("\n")}\n}, (table) => ({\n  uniqueLocale: unique().on(table._entityId, table._languageCode),\n}));`;
@@ -121,23 +121,22 @@ const generateVersionsTable = (collection: CollectionConfig): string | null => {
 });`;
 };
 
-const generateSchemaFile = (): string => {
+const generateSchemaFile = (config: CMSConfig): string => {
   const parts: string[] = [
     `// auto-generated — do not edit`,
-    `import { sqliteTable, text, integer, real, unique } from "drizzle-orm/sqlite-core";`,
+    `import { sqliteTable, text, integer, real, unique, index, primaryKey } from "drizzle-orm/sqlite-core";`,
     ``,
   ];
 
   for (const collection of config.collections) {
     parts.push(generateMainTable(collection));
-    const translationsTable = generateTranslationsTable(collection);
+    const translationsTable = generateTranslationsTable(config, collection);
     if (translationsTable) parts.push("", translationsTable);
     const versionsTable = generateVersionsTable(collection);
     if (versionsTable) parts.push("", versionsTable);
     parts.push("");
   }
 
-  // System tables
   parts.push(`export const cmsAssets = sqliteTable("cms_assets", {
   _id: text("_id").primaryKey(),
   filename: text("filename").notNull(),
@@ -150,28 +149,23 @@ const generateSchemaFile = (): string => {
   alt: text("alt"),
   folder: text("folder"),
   storagePath: text("storage_path").notNull(),
+  hash: text("hash"),
   _createdAt: text("_created_at").notNull(),
 });`);
-
   parts.push("");
-
   parts.push(`export const cmsAssetFolders = sqliteTable("cms_asset_folders", {
   _id: text("_id").primaryKey(),
   name: text("name").notNull(),
   parent: text("parent"),
   _createdAt: text("_created_at").notNull(),
 });`);
-
   parts.push("");
-
   parts.push(`export const cmsSessions = sqliteTable("cms_sessions", {
   _id: text("_id").primaryKey(),
   userId: text("user_id").notNull(),
   expiresAt: text("expires_at").notNull(),
 });`);
-
   parts.push("");
-
   parts.push(`export const cmsLocks = sqliteTable("cms_locks", {
   _id: text("_id").primaryKey(),
   collection: text("collection").notNull(),
@@ -180,9 +174,7 @@ const generateSchemaFile = (): string => {
   userEmail: text("user_email").notNull(),
   lockedAt: text("locked_at").notNull(),
 });`);
-
   parts.push("");
-
   parts.push(`export const cmsInvites = sqliteTable("cms_invites", {
   _id: text("_id").primaryKey(),
   userId: text("user_id").notNull(),
@@ -190,10 +182,84 @@ const generateSchemaFile = (): string => {
   expiresAt: text("expires_at").notNull(),
   usedAt: text("used_at"),
 });`);
-
+  parts.push("");
+  parts.push(`export const cmsPasswordResets = sqliteTable("cms_password_resets", {
+  _id: text("_id").primaryKey(),
+  userId: text("user_id").notNull(),
+  token: text("token").notNull().unique(),
+  expiresAt: text("expires_at").notNull(),
+  usedAt: text("used_at"),
+});`);
+  parts.push("");
+  parts.push(`export const cmsRateLimits = sqliteTable("cms_rate_limits", {
+  _id: text("_id").primaryKey(),
+  windowStart: integer("window_start").notNull(),
+  count: integer("count").notNull(),
+  expiresAt: integer("expires_at").notNull(),
+}, (table) => ({
+  expiryIdx: index("rate_limits_expiry_idx").on(table.expiresAt),
+}));`);
+  parts.push("");
+  parts.push(`export const cmsAuditLog = sqliteTable("cms_audit_log", {
+  _id: text("_id").primaryKey(),
+  timestamp: integer("timestamp").notNull(),
+  actorId: text("actor_id"),
+  actorEmail: text("actor_email"),
+  actorRole: text("actor_role"),
+  action: text("action").notNull(),
+  resourceType: text("resource_type").notNull(),
+  resourceCollection: text("resource_collection"),
+  resourceId: text("resource_id"),
+  ipAddress: text("ip_address"),
+  userAgent: text("user_agent"),
+}, (table) => ({
+  timestampIdx: index("audit_timestamp_idx").on(table.timestamp),
+  actorIdx: index("audit_actor_idx").on(table.actorId),
+  resourceIdx: index("audit_resource_idx").on(table.resourceType, table.resourceCollection, table.resourceId),
+}));`);
+  parts.push("");
+  parts.push(`export const cmsOutbox = sqliteTable("cms_outbox", {
+  _id: text("_id").primaryKey(),
+  type: text("type").notNull(),
+  payload: text("payload"),
+  status: text("status").notNull().default("pending"),
+  attempts: integer("attempts").notNull().default(0),
+  maxAttempts: integer("max_attempts").notNull().default(5),
+  nextAttemptAt: integer("next_attempt_at").notNull(),
+  dedupeKey: text("dedupe_key"),
+  lastError: text("last_error"),
+  createdAt: integer("created_at").notNull(),
+  updatedAt: integer("updated_at").notNull(),
+}, (table) => ({
+  dueIdx: index("outbox_due_idx").on(table.status, table.nextAttemptAt),
+  dedupeIdx: index("outbox_dedupe_idx").on(table.dedupeKey),
+}));`);
+  parts.push("");
+  parts.push(`export const cmsCollaboration = sqliteTable("cms_collaboration", {
+  collection: text("collection").notNull(),
+  documentId: text("document_id").notNull(),
+  reviewState: text("review_state").notNull(),
+  editor: text("editor"),
+  updatedAt: text("updated_at").notNull(),
+}, (table) => ({
+  pk: primaryKey({ columns: [table.collection, table.documentId] }),
+}));`);
+  parts.push("");
+  parts.push(`export const cmsComments = sqliteTable("cms_comments", {
+  _id: text("_id").primaryKey(),
+  collection: text("collection").notNull(),
+  documentId: text("document_id").notNull(),
+  field: text("field"),
+  body: text("body").notNull(),
+  authorId: text("author_id"),
+  authorEmail: text("author_email"),
+  resolved: integer("resolved", { mode: "boolean" }).notNull().default(false),
+  createdAt: text("created_at").notNull(),
+}, (table) => ({
+  docIdx: index("comments_doc_idx").on(table.collection, table.documentId),
+}));`);
   parts.push("");
 
-  // Export a lookup of table variables for the API layer
   const tableExports: string[] = [];
   for (const collection of config.collections) {
     const varName = `cms${pascalCase(collection.slug)}`;
@@ -213,55 +279,54 @@ const generateSchemaFile = (): string => {
   return parts.join("\n");
 };
 
-// -----------------------
-// validators.ts generation
-// -----------------------
-
 const zodTypeForField = (field: FieldConfig): string => {
-  if (
-    field.type === "text" ||
-    field.type === "slug" ||
-    field.type === "email" ||
-    field.type === "image" ||
-    field.type === "date"
-  ) {
-    let z = "z.string()";
-    if (field.type === "email") z = `z.string().email()`;
-    if (field.type === "text" && field.maxLength) z = `z.string().max(${field.maxLength})`;
-    return z;
+  if (["text", "slug", "email", "image", "date"].includes(field.type)) {
+    let zodType = "z.string()";
+    if (field.type === "email") zodType = "z.string().email()";
+    if (field.type === "text" && field.maxLength) zodType = `z.string().max(${field.maxLength})`;
+    return zodType;
   }
   if (field.type === "number") return "z.number()";
   if (field.type === "boolean") return "z.boolean()";
-  if (field.type === "select") {
-    return `z.enum([${field.options.map((o) => JSON.stringify(o)).join(", ")}])`;
-  }
+  if (field.type === "select") return `z.enum([${field.options.map((option) => JSON.stringify(option)).join(", ")}])`;
   if (field.type === "relation") {
-    return field.hasMany ? "z.array(z.string())" : "z.string()";
+    if (!field.hasMany) return "z.string()";
+    return field.maxItems ? `z.array(z.string()).max(${field.maxItems})` : "z.array(z.string())";
   }
   if (field.type === "array") {
-    return `z.array(${zodTypeForField(field.of)})`;
+    const inner = `z.array(${zodTypeForField(field.of)})`;
+    return field.maxItems ? `${inner}.max(${field.maxItems})` : inner;
   }
-  if (field.type === "richText") {
+  if (field.type === "richText" || field.type === "content")
     return "z.object({ type: z.literal('root'), children: z.array(z.any()) })";
-  }
-  if (field.type === "json") {
-    return "z.record(z.unknown())";
-  }
+  if (field.type === "json") return "z.record(z.unknown())";
   if (field.type === "blocks") {
+    const allowShared = field.shared !== false;
+    const sharedVariant =
+      'z.object({ type: z.literal("__shared"), ref: z.string(), title: z.string().optional(), blockType: z.string().optional() })';
     const variants = Object.entries(field.types).map(([blockType, fields]) => {
       const members = Object.entries(fields)
-        .map(([fn, f]) => `${fn}: ${zodTypeForField(f)}${f.required ? "" : ".optional()"}`)
+        .map(
+          ([fieldName, nestedField]) =>
+            `${fieldName}: ${zodTypeForField(nestedField)}${nestedField.required ? "" : ".optional()"}`,
+        )
         .join(", ");
       return `z.object({ type: z.literal(${JSON.stringify(blockType)}), ${members} })`;
     });
-    if (variants.length === 0) return "z.array(z.record(z.unknown()))";
-    if (variants.length === 1) return `z.array(${variants[0]})`;
-    return `z.array(z.discriminatedUnion("type", [\n    ${variants.join(",\n    ")},\n  ]))`;
+    if (!allowShared) {
+      if (variants.length === 0) return "z.array(z.record(z.unknown()))";
+      if (variants.length === 1) return `z.array(${variants[0]})`;
+      return `z.array(z.discriminatedUnion("type", [\n    ${variants.join(",\n    ")},\n  ]))`;
+    }
+    if (variants.length === 0) return `z.array(${sharedVariant})`;
+    if (variants.length === 1)
+      return `z.array(z.discriminatedUnion("type", [\n    ${sharedVariant},\n    ${variants[0]},\n  ]))`;
+    return `z.array(z.discriminatedUnion("type", [\n    ${sharedVariant},\n    ${variants.join(",\n    ")},\n  ]))`;
   }
   return "z.unknown()";
 };
 
-const generateValidatorsFile = (): string => {
+const generateValidatorsFile = (config: CMSConfig): string => {
   const parts: string[] = [`// auto-generated — do not edit`, `import { z } from "zod";`, ``];
 
   for (const collection of config.collections) {
@@ -283,54 +348,48 @@ const generateValidatorsFile = (): string => {
     parts.push("");
   }
 
-  // Export map for runtime access
-  const mapEntries = config.collections.map((c) => {
-    const name = pascalCase(c.slug);
-    return `  ${c.slug}: { create: ${name}CreateSchema, update: ${name}UpdateSchema },`;
+  const mapEntries = config.collections.map((collection) => {
+    const name = pascalCase(collection.slug);
+    return `  "${collection.slug}": { create: ${name}CreateSchema, update: ${name}UpdateSchema },`;
   });
   parts.push(`export const validators = {\n${mapEntries.join("\n")}\n};`);
 
   return parts.join("\n");
 };
 
-// ---------------------
-// types.ts generation
-// ---------------------
-
 const typeForField = (field: FieldConfig): string => {
-  if (
-    field.type === "text" ||
-    field.type === "slug" ||
-    field.type === "email" ||
-    field.type === "image" ||
-    field.type === "date"
-  )
-    return "string";
+  if (["text", "slug", "email", "image", "date"].includes(field.type)) return "string";
   if (field.type === "number") return "number";
   if (field.type === "boolean") return "boolean";
-  if (field.type === "select") return field.options.map((o) => JSON.stringify(o)).join(" | ");
+  if (field.type === "select") return field.options.map((option) => JSON.stringify(option)).join(" | ");
   if (field.type === "relation") return field.hasMany ? "string[]" : "string";
   if (field.type === "array") return `${typeForField(field.of)}[]`;
   if (field.type === "richText") return "RichTextDocument";
+  if (field.type === "content") return "ContentDocument";
   if (field.type === "json") return "Record<string, unknown>";
   if (field.type === "blocks") {
+    const allowShared = field.shared !== false;
+    const sharedVariant = `{ type: "__shared"; ref: string; title?: string; blockType?: string }`;
     const variants = Object.entries(field.types).map(([blockType, fields]) => {
       const members = Object.entries(fields)
-        .map(([fn, f]) => `${fn}${f.required ? "" : "?"}: ${typeForField(f)};`)
+        .map(
+          ([fieldName, nestedField]) => `${fieldName}${nestedField.required ? "" : "?"}: ${typeForField(nestedField)};`,
+        )
         .join(" ");
       return `{ type: ${JSON.stringify(blockType)}; ${members} }`;
     });
-    return `Array<${variants.join(" | ")}>`;
+    const union = allowShared ? [...variants, sharedVariant] : variants;
+    return union.length > 0 ? `Array<${union.join(" | ")}>` : "Array<Record<string, unknown>>";
   }
   return "unknown";
 };
 
-const generateTypesFile = (): string => {
+const generateTypesFile = (config: CMSConfig, coreImportPath: string): string => {
   const parts: string[] = [
     `// auto-generated — do not edit`,
-    `import type { RichTextDocument } from "../core/define";`,
+    `import type { RichTextDocument, ContentDocument } from "${coreImportPath}";`,
     ``,
-    `export type CMSCollectionSlug = ${config.collections.map((c) => JSON.stringify(c.slug)).join(" | ")};`,
+    `export type CMSCollectionSlug = ${config.collections.map((collection) => JSON.stringify(collection.slug)).join(" | ")};`,
     ``,
   ];
 
@@ -348,7 +407,9 @@ const generateTypesFile = (): string => {
       .join("\n");
 
     const translationEntries = translatableFields.length
-      ? translatableFields.map((fn) => `  ${fn}?: ${typeForField(collection.fields[fn])};`).join("\n")
+      ? translatableFields
+          .map((fieldName) => `  ${fieldName}?: ${typeForField(collection.fields[fieldName])};`)
+          .join("\n")
       : "  [key: string]: never;";
 
     parts.push(`export type ${inputName} = {\n${fieldEntries}\n};`);
@@ -378,14 +439,15 @@ const generateTypesFile = (): string => {
   return parts.join("\n");
 };
 
-// --------------------
-// api.ts generation
-// --------------------
-
-const generateApiFile = (): string => {
+const generateApiFile = (
+  config: CMSConfig,
+  coreImportPath: string,
+  runtimeImportPath: string,
+  configImportPath: string,
+) => {
   const imports = config.collections
-    .map((c) => {
-      const name = pascalCase(c.slug);
+    .map((collection) => {
+      const name = pascalCase(collection.slug);
       return [`${name}Document`, `${name}Input`, `${name}TranslationInput`];
     })
     .flat();
@@ -393,37 +455,37 @@ const generateApiFile = (): string => {
   const apiTypes = config.collections
     .map((collection) => {
       const baseName = pascalCase(collection.slug);
-      const ctx = `context?: { user?: { id: string; role?: string; email?: string } | null }`;
+      const ctx = `context?: { user?: { id: string; role?: string; email?: string; [key: string]: unknown } | null; _system?: boolean }`;
       const apiKey = /^[a-zA-Z_$][a-zA-Z0-9_$]*$/.test(collection.slug) ? collection.slug : `"${collection.slug}"`;
       return `  ${apiKey}: {
-    find(options?: import("../core/api").FindOptions, ${ctx}): Promise<${baseName}Document[]>;
+    find(options?: import("${coreImportPath}").FindOptions, ${ctx}): Promise<${baseName}Document[]>;
     findOne(filter: Record<string, unknown> & { locale?: string; status?: "draft" | "published" | "scheduled" | "any" }, ${ctx}): Promise<${baseName}Document | null>;
     findById(id: string, options?: { locale?: string; status?: "draft" | "published" | "scheduled" | "any" }, ${ctx}): Promise<${baseName}Document | null>;
     create(data: ${baseName}Input, ${ctx}): Promise<${baseName}Document>;
+    createMany(items: ${baseName}Input[], ${ctx}): Promise<${baseName}Document[]>;
+    upsert(data: ${baseName}Input & { _id?: string }, ${ctx}): Promise<${baseName}Document>;
     update(id: string, data: Partial<${baseName}Input>, ${ctx}): Promise<${baseName}Document>;
     delete(id: string, ${ctx}): Promise<void>;
-    count(filter?: Omit<import("../core/api").FindOptions, "limit" | "offset" | "sort">, ${ctx}): Promise<number>;
-    versions(id: string): Promise<import("./types").StoredVersion[]>;
+    count(filter?: Omit<import("${coreImportPath}").FindOptions, "limit" | "offset" | "sort">, ${ctx}): Promise<number>;
+    versions(id: string, ${ctx}): Promise<import("./types").StoredVersion[]>;
     restore(id: string, versionNumber: number, ${ctx}): Promise<${baseName}Document>;
     publish(id: string, ${ctx}): Promise<${baseName}Document>;
     unpublish(id: string, ${ctx}): Promise<${baseName}Document>;
     schedule(id: string, publishAt: string, unpublishAt?: string | null, ${ctx}): Promise<${baseName}Document>;
-    getTranslations(id: string): Promise<Record<string, ${baseName}TranslationInput>>;
+    getTranslations(id: string, ${ctx}): Promise<Record<string, ${baseName}TranslationInput>>;
     upsertTranslation(id: string, locale: string, data: ${baseName}TranslationInput, ${ctx}): Promise<${baseName}Document>;
   };`;
     })
     .join("\n");
 
   return `// auto-generated — do not edit
-import access from "../access";
-import config from "../cms.config";
-import { createCms } from "../core/api";
-import hooks from "../hooks";
+import config from "${configImportPath}";
+import { createCms } from "${runtimeImportPath}";
 import type {
-  ${imports.map((i) => `${i},`).join("\n  ")}
+  ${imports.map((entry) => `${entry},`).join("\n  ")}
 } from "./types";
 
-export const cms = createCms(config, access, hooks) as {
+export const cms = createCms(config) as {
 ${apiTypes}
   meta: ReturnType<typeof createCms>["meta"];
   scheduled: ReturnType<typeof createCms>["scheduled"];
@@ -431,18 +493,27 @@ ${apiTypes}
 `;
 };
 
-// --------------------
-// Run
-// --------------------
-
-const run = async () => {
-  await mkdir(generatedDir, { recursive: true });
-  await Promise.all([
-    writeFile(path.join(generatedDir, "schema.ts"), generateSchemaFile(), "utf-8"),
-    writeFile(path.join(generatedDir, "types.ts"), generateTypesFile(), "utf-8"),
-    writeFile(path.join(generatedDir, "validators.ts"), generateValidatorsFile(), "utf-8"),
-    writeFile(path.join(generatedDir, "api.ts"), generateApiFile(), "utf-8"),
-  ]);
+// Temp file + rename: a concurrent reader never sees a partially-written file.
+const writeFileAtomic = async (filePath: string, content: string) => {
+  const tmpPath = `${filePath}.${randomUUID()}.tmp`;
+  await writeFile(tmpPath, content, "utf-8");
+  await rename(tmpPath, filePath);
 };
 
-await run();
+export const generate = async (config: CMSConfig, options: GeneratorOptions) => {
+  const outputDir = options.outputDir;
+  const coreImportPath = options.coreImportPath ?? "@/cms/core";
+  const runtimeImportPath = options.runtimeImportPath ?? "../runtime";
+  const configImportPath = options.configImportPath ?? "../cms.config";
+
+  await mkdir(outputDir, { recursive: true });
+  await Promise.all([
+    writeFileAtomic(path.join(outputDir, "schema.ts"), generateSchemaFile(config)),
+    writeFileAtomic(path.join(outputDir, "types.ts"), generateTypesFile(config, coreImportPath)),
+    writeFileAtomic(path.join(outputDir, "validators.ts"), generateValidatorsFile(config)),
+    writeFileAtomic(
+      path.join(outputDir, "api.ts"),
+      generateApiFile(config, coreImportPath, runtimeImportPath, configImportPath),
+    ),
+  ]);
+};

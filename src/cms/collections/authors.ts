@@ -1,4 +1,4 @@
-import { defineCollection, fields } from "../core/define";
+import { defineCollection, fields } from "@/cms/core";
 
 export default defineCollection({
   slug: "authors",
@@ -11,8 +11,8 @@ export default defineCollection({
   fields: {
     name: fields.text({ required: true }),
     description: fields.text({ translatable: true }),
-    slug: fields.slug({ from: "name", unique: true, admin: { position: "sidebar" } }),
-    title: fields.text({ required: true }),
+    slug: fields.slug({ from: "name", admin: { position: "sidebar" } }),
+    title: fields.text(),
     avatar: fields.image({
       admin: { placeholder: "https://images.example.com/avatar.jpg" },
     }),

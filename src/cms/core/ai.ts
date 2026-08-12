@@ -1,33 +1,32 @@
-import { readFile } from "node:fs/promises";
-import path from "node:path";
-import { streamText } from "ai";
-import { env as cfEnv } from "cloudflare:workers";
+import { getStorage, readEnv } from "./runtime";
 
-const env = (key: string) => (cfEnv as Record<string, string>)[key] ?? import.meta.env[key];
+const getStreamText = async () => (await import("ai")).streamText;
 
 export function isAiEnabled(): boolean {
-  return !!(env("AI_PROVIDER") && env("AI_API_KEY"));
+  return !!(readEnv("AI_PROVIDER") && readEnv("AI_API_KEY"));
 }
 
-export async function getAiModel() {
-  const provider = env("AI_PROVIDER") || "openai";
-  const modelName = env("AI_MODEL") || "gpt-4o-mini";
+export async function getAiModel(): Promise<any> {
+  const provider = readEnv("AI_PROVIDER") || "openai";
+  const modelName = readEnv("AI_MODEL") || "gpt-4o-mini";
 
   if (provider === "openai") {
     const { createOpenAI } = await import("@ai-sdk/openai");
-    const openai = createOpenAI({ apiKey: env("AI_API_KEY") });
+    const openai = createOpenAI({ apiKey: readEnv("AI_API_KEY") });
     return openai(modelName);
   }
 
   throw new Error(`Unsupported AI provider: ${provider}`);
 }
 
-export async function streamAltText(imageUrl: string, filename: string) {
+export async function streamAltText(imageUrl: string, filename: string): Promise<any> {
   const model = await getAiModel();
+  const image = await getStorage().getFile(imageUrl);
+  if (!image) {
+    throw new Error(`Image not found: ${imageUrl}`);
+  }
 
-  // Read image from disk since the server can't fetch its own URLs reliably
-  const diskPath = path.join(process.cwd(), "public", imageUrl);
-  const buffer = await readFile(diskPath);
+  const streamText = await getStreamText();
   return streamText({
     model,
     messages: [
@@ -36,7 +35,7 @@ export async function streamAltText(imageUrl: string, filename: string) {
         content: [
           {
             type: "image",
-            image: buffer,
+            image: new Uint8Array(image),
           },
           {
             type: "text",
@@ -48,15 +47,15 @@ export async function streamAltText(imageUrl: string, filename: string) {
   });
 }
 
-export async function streamSeoDescription(content: { title: string; excerpt?: string; body?: string }) {
+export async function streamSeoDescription(content: { title: string; excerpt?: string; body?: string }): Promise<any> {
   const model = await getAiModel();
-
   const prompt = `Generate an SEO-optimized meta description (max 155 characters) for a page with the following content. Return only the description, no quotes or extra formatting.
 
 Title: ${content.title}
 ${content.excerpt ? `Excerpt: ${content.excerpt}` : ""}
 ${content.body ? `Body preview: ${content.body.substring(0, 500)}` : ""}`;
 
+  const streamText = await getStreamText();
   return streamText({ model, prompt });
 }
 
@@ -66,7 +65,7 @@ export async function streamTranslation(content: {
   targetLocale: string;
   fieldName: string;
   fieldType: "text" | "richText" | "slug";
-}) {
+}): Promise<any> {
   const model = await getAiModel();
 
   let prompt: string;
@@ -83,5 +82,6 @@ ${content.text}`;
 ${content.text}`;
   }
 
+  const streamText = await getStreamText();
   return streamText({ model, prompt });
 }

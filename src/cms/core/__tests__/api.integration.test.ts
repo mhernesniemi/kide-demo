@@ -1,0 +1,315 @@
+/**
+ * Integration tests: real generated schema + real cms.config on an in-memory SQLite DB.
+ * Exercises the full createCms pipeline — coercion, validation, slugs, drafts/publish,
+ * translations, versions — plus DB-backed sessions and invites.
+ */
+import Database from "better-sqlite3";
+import { eq } from "drizzle-orm";
+import { drizzle } from "drizzle-orm/better-sqlite3";
+import { pushSQLiteSchema } from "drizzle-kit/api";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+
+import * as generatedSchema from "@/cms/.generated/schema";
+import config from "@/cms/cms.config";
+import { createCms } from "../api";
+import { createInvite, consumeInvite, createSession, hashToken, validateInvite, validateSession } from "../auth";
+import { configureCmsRuntime, resetCmsRuntime } from "../runtime";
+import { initSchema, resetSchema } from "../schema";
+
+let sqlite: InstanceType<typeof Database>;
+let db: ReturnType<typeof drizzle>;
+let cms: ReturnType<typeof createCms>;
+
+beforeAll(async () => {
+  sqlite = new Database(":memory:");
+  db = drizzle(sqlite);
+
+  // Create all tables from the real generated schema. drizzle-kit's apply()
+  // assumes a libsql driver (calls .all() on DDL), so execute the generated
+  // statements directly against better-sqlite3 instead.
+  const { statementsToExecute } = await pushSQLiteSchema({ ...generatedSchema }, db as never);
+  for (const statement of statementsToExecute) sqlite.exec(statement);
+
+  initSchema(generatedSchema as never);
+
+  const files = new Map<string, Uint8Array>();
+  configureCmsRuntime({
+    getDb: async () => db,
+    storage: {
+      putFile: async (p, data) => {
+        files.set(p, data instanceof Uint8Array ? data : new Uint8Array(data));
+      },
+      getFile: async (p) => {
+        const data = files.get(p);
+        if (!data) return null;
+        return data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer;
+      },
+      deleteFile: async (p) => {
+        files.delete(p);
+      },
+    },
+  });
+
+  cms = createCms(config);
+});
+
+afterAll(() => {
+  resetCmsRuntime();
+  resetSchema();
+  sqlite.close();
+});
+
+describe("create", () => {
+  it("creates a document with timestamps and an auto-generated slug", async () => {
+    const author = await (cms as any).authors.create({ name: "Ada Lovelace" });
+    expect(author._id).toBeTruthy();
+    expect(author.slug).toBe("ada-lovelace");
+    expect(author._createdAt).toBeTruthy();
+    expect(author._updatedAt).toBeTruthy();
+  });
+
+  it("rejects missing required fields", async () => {
+    await expect((cms as any).authors.create({ title: "No name" })).rejects.toThrow(/required/);
+  });
+
+  it("slugifies an explicitly provided slug", async () => {
+    const author = await (cms as any).authors.create({ name: "Slug Test", slug: "My Custom Slug!" });
+    expect(author.slug).toBe("my-custom-slug");
+  });
+
+  it("coerces field values from form-style input", async () => {
+    const post = await (cms as any).posts.create({
+      title: "Coercion test",
+      body: { type: "root", children: [{ type: "paragraph", children: [{ type: "text", value: "Hello body" }] }] },
+    });
+    // richText stored as parsed AST after round-trip
+    expect(post.body.type).toBe("root");
+    // beforeCreate hook derived the excerpt from the body
+    expect(post.excerpt).toBe("Hello body");
+  });
+
+  it("coerces plain text into a richText AST", async () => {
+    const post = await (cms as any).posts.create({ title: "Plain body", body: "Just plain text" });
+    expect(post.body.type).toBe("root");
+    expect(post.body.children[0].type).toBe("paragraph");
+  });
+
+  it("throws a helpful error for unknown collections", () => {
+    expect(() => (cms as any).nonexistent.create({})).toThrow();
+  });
+});
+
+describe("find / findOne / findById", () => {
+  it("finds by field equality", async () => {
+    await (cms as any).authors.create({ name: "Findable Person" });
+    const found = await (cms as any).authors.findOne({ slug: "findable-person" });
+    expect(found?.name).toBe("Findable Person");
+  });
+
+  it("returns null for findById misses", async () => {
+    expect(await (cms as any).authors.findById("missing-id")).toBeNull();
+  });
+
+  it("respects limit and sort", async () => {
+    await (cms as any).authors.create({ name: "Aaa Sort" });
+    await (cms as any).authors.create({ name: "Zzz Sort" });
+    const result = await (cms as any).authors.find({
+      sort: { field: "name", direction: "desc" },
+      limit: 1,
+    });
+    expect(result).toHaveLength(1);
+    expect(result[0].name).toBe("Zzz Sort");
+  });
+});
+
+describe("update / delete", () => {
+  it("updates fields and bumps _updatedAt", async () => {
+    const author = await (cms as any).authors.create({ name: "Update Me" });
+    const updated = await (cms as any).authors.update(author._id, { title: "Editor-in-chief" });
+    expect(updated.title).toBe("Editor-in-chief");
+    expect(updated.name).toBe("Update Me");
+  });
+
+  it("enforces required fields on update", async () => {
+    const author = await (cms as any).authors.create({ name: "Keep Name" });
+    // Clearing a required field must fail
+    await expect((cms as any).authors.update(author._id, { name: "" })).rejects.toThrow(/required/);
+  });
+
+  it("deletes documents", async () => {
+    const author = await (cms as any).authors.create({ name: "Delete Me" });
+    await (cms as any).authors.delete(author._id);
+    expect(await (cms as any).authors.findById(author._id)).toBeNull();
+  });
+});
+
+describe("drafts and publishing", () => {
+  it("creates drafts by default in draft-enabled collections", async () => {
+    const post = await (cms as any).posts.create({ title: "Draft post" });
+    expect(post._status).toBe("draft");
+  });
+
+  it("excludes drafts from published queries and includes them after publish", async () => {
+    const post = await (cms as any).posts.create({ title: "Publish flow" });
+
+    const before = await (cms as any).posts.findOne({ slug: "publish-flow", status: "published" });
+    expect(before).toBeNull();
+
+    const published = await (cms as any).posts.publish(post._id);
+    expect(published._status).toBe("published");
+    expect(published._publishedAt).toBeTruthy();
+
+    const after = await (cms as any).posts.findOne({ slug: "publish-flow", status: "published" });
+    expect(after?._id).toBe(post._id);
+  });
+
+  it("unpublishes back to draft", async () => {
+    const post = await (cms as any).posts.create({ title: "Unpublish flow" });
+    await (cms as any).posts.publish(post._id);
+    const unpublished = await (cms as any).posts.unpublish(post._id);
+    expect(unpublished._status).toBe("draft");
+  });
+
+  it("schedules publication", async () => {
+    const post = await (cms as any).posts.create({ title: "Scheduled post" });
+    const future = new Date(Date.now() + 86_400_000).toISOString();
+    const scheduled = await (cms as any).posts.schedule(post._id, future);
+    expect(scheduled._status).toBe("scheduled");
+    expect(scheduled._publishAt).toBe(future);
+  });
+});
+
+describe("translations", () => {
+  it("upserts and retrieves locale overlays", async () => {
+    const author = await (cms as any).authors.create({ name: "Translated", description: "English text" });
+    await (cms as any).authors.upsertTranslation(author._id, "fi", { description: "Suomeksi" });
+
+    const translations = await (cms as any).authors.getTranslations(author._id);
+    expect(translations.fi?.description).toBe("Suomeksi");
+
+    const finnish = await (cms as any).authors.findById(author._id, { locale: "fi" });
+    expect(finnish?.description).toBe("Suomeksi");
+    expect(finnish?.name).toBe("Translated"); // non-translatable field untouched
+  });
+
+  it("findOne matches translated values of translatable fields per locale", async () => {
+    const post = await (cms as any).posts.create({ title: "Localized lookup", slug: "localized-lookup" });
+    await (cms as any).posts.upsertTranslation(post._id, "fi", { title: "Lokalisoitu haku", slug: "lokalisoitu-haku" });
+
+    // The translated slug resolves under its locale.
+    const byFiSlug = await (cms as any).posts.findOne({ slug: "lokalisoitu-haku", locale: "fi", status: "any" });
+    expect(byFiSlug?._id).toBe(post._id);
+
+    // The base slug still resolves for a locale with no translation…
+    const byBaseSlug = await (cms as any).posts.findOne({ slug: "localized-lookup", locale: "en", status: "any" });
+    expect(byBaseSlug?._id).toBe(post._id);
+
+    // …but not under a locale whose translation overrides the value.
+    const crossLocale = await (cms as any).posts.findOne({ slug: "localized-lookup", locale: "fi", status: "any" });
+    expect(crossLocale).toBeNull();
+  });
+});
+
+describe("versions", () => {
+  it("records version snapshots on update", async () => {
+    const post = await (cms as any).posts.create({ title: "Versioned post" });
+    await (cms as any).posts.update(post._id, { title: "Versioned post v2" });
+    const versions = await (cms as any).posts.versions(post._id);
+    expect(Array.isArray(versions)).toBe(true);
+    expect(versions.length).toBeGreaterThanOrEqual(1);
+  });
+});
+
+describe("sessions", () => {
+  it("creates and validates a session", async () => {
+    const { token, expiresAt } = await createSession("user-1");
+    expect(new Date(expiresAt).getTime()).toBeGreaterThan(Date.now());
+
+    const session = await validateSession(token);
+    expect(session?.userId).toBe("user-1");
+  });
+
+  it("rejects unknown tokens", async () => {
+    expect(await validateSession("nope")).toBeNull();
+  });
+
+  it("rejects and deletes expired sessions", async () => {
+    const schema = generatedSchema as never as { cmsSessions: any };
+    const past = new Date(Date.now() - 1000).toISOString();
+    // Sessions are stored under SHA-256(token), never the raw token.
+    const idHash = await hashToken("expired-token");
+    await db.insert(schema.cmsSessions).values({ _id: idHash, userId: "user-2", expiresAt: past });
+
+    expect(await validateSession("expired-token")).toBeNull();
+    // Second lookup confirms the row was deleted, not just rejected
+    const rows = await db
+      .select()
+      .from(schema.cmsSessions)
+      .where(eq((schema.cmsSessions as any)._id, idHash));
+    expect(rows).toHaveLength(0);
+  });
+
+  it("stores the session token only as a hash, never raw", async () => {
+    const schema = generatedSchema as never as { cmsSessions: any };
+    const { token } = await createSession("user-3");
+    const raw = await db
+      .select()
+      .from(schema.cmsSessions)
+      .where(eq((schema.cmsSessions as any)._id, token));
+    expect(raw).toHaveLength(0); // raw token is not the key
+    const hashed = await db
+      .select()
+      .from(schema.cmsSessions)
+      .where(eq((schema.cmsSessions as any)._id, await hashToken(token)));
+    expect(hashed).toHaveLength(1);
+  });
+});
+
+describe("invites", () => {
+  it("validates an unused invite and rejects it after consumption", async () => {
+    const { token } = await createInvite("user-3");
+    expect((await validateInvite(token))?.userId).toBe("user-3");
+
+    await consumeInvite(token);
+    expect(await validateInvite(token)).toBeNull();
+  });
+});
+
+// Runs last: the full-collection wipe clears authors/posts created above.
+describe("deleteMany", () => {
+  it("bulk-deletes documents matching a filter, leaving others", async () => {
+    await (cms as any).posts.create({ title: "Bulk A", category: "bulk-del" });
+    await (cms as any).posts.create({ title: "Bulk B", category: "bulk-del" });
+    await (cms as any).posts.create({ title: "Keep C", category: "keep-me" });
+
+    const removed = await (cms as any).posts.deleteMany({ category: "bulk-del" }, { _system: true });
+    expect(removed).toBe(2);
+
+    expect(await (cms as any).posts.find({ where: { category: "bulk-del" }, status: "any" })).toHaveLength(0);
+    expect(
+      (await (cms as any).posts.find({ where: { category: "keep-me" }, status: "any" })).length,
+    ).toBeGreaterThanOrEqual(1);
+  });
+
+  it("returns 0 when nothing matches", async () => {
+    expect(await (cms as any).posts.deleteMany({ category: "no-such-category" }, { _system: true })).toBe(0);
+  });
+
+  it("clears an entire collection (and its translations) when no filter is given", async () => {
+    await (cms as any).authors.create({ name: "Wipe One" });
+    await (cms as any).authors.create({ name: "Wipe Two" });
+    const before = await (cms as any).authors.find();
+    expect(before.length).toBeGreaterThanOrEqual(2);
+
+    const removed = await (cms as any).authors.deleteMany({}, { _system: true });
+    expect(removed).toBe(before.length);
+    expect(await (cms as any).authors.find()).toHaveLength(0);
+  });
+});
+
+describe("createCms config guard", () => {
+  it("diagnoses a partially-evaluated config (module cycle) instead of crashing cryptically", () => {
+    expect(() => createCms(undefined as never)).toThrow(/module cycle/);
+    expect(() => createCms({} as never)).toThrow(/module cycle/);
+  });
+});

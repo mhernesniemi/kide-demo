@@ -3,11 +3,19 @@ import PublicLayout from "@/layouts/PublicLayout.astro";
 import BlockRenderer from "@/components/BlockRenderer.astro";
 import type { PostsDocument } from "@/cms/.generated/types";
 import { cms } from "@/cms/.generated/api";
-import { parseBlocks } from "@/cms/core/content";
+import { getSharedSectionTagsFromBlocks, parseBlocks } from "@/cms/core";
 
 const isPreview = Astro.url.searchParams.has("preview");
 const page = await cms["front-page"].findOne({ status: isPreview ? "any" : "published" });
 const blocks = parseBlocks(page?.blocks);
+
+// Resolve hero ctaHref relation (page ID → slug URL)
+for (const block of blocks) {
+  if (block.type === "hero" && block.ctaHref) {
+    const linked = await cms.pages.findOne({ where: { _id: String(block.ctaHref) } });
+    if (linked) block.ctaHref = `/${linked.slug}`;
+  }
+}
 
 const posts = await cms.posts.find({
   status: "published",
@@ -15,13 +23,19 @@ const posts = await cms.posts.find({
   limit: 10,
 });
 
-if (!isPreview) Astro.cache.set({ tags: ["front-page", "posts", "home"] });
+if (!isPreview) Astro.cache.set({ tags: ["front-page", "posts", "home", ...getSharedSectionTagsFromBlocks(blocks)] });
 ---
 
 <PublicLayout title="Kide CMS">
   <div class="mx-auto flex max-w-4xl gap-8 px-4 py-8">
     <main class="min-w-0 flex-1">
-      {blocks.length > 0 ? <BlockRenderer blocks={blocks} /> : <p class="text-gray-500">No content yet.</p>}
+      {
+        blocks.length > 0 ? (
+          <BlockRenderer blocks={blocks} status={isPreview ? "any" : "published"} />
+        ) : (
+          <p class="text-gray-500">No content yet.</p>
+        )
+      }
     </main>
 
     <aside class="hidden w-64 shrink-0 lg:block">

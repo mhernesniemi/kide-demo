@@ -1,4 +1,4 @@
-import { defineCollection, fields, hasRole } from "../core/define";
+import { defineCollection, fields, hasRole } from "@/cms/core";
 
 export default defineCollection({
   slug: "front-page",
@@ -11,6 +11,15 @@ export default defineCollection({
     publish: hasRole("admin"),
   },
   fields: {
+    seoDescription: fields.text({
+      maxLength: 160,
+      translatable: true,
+      admin: {
+        rows: 3,
+        help: "Meta description for search engines. Max 160 characters.",
+        position: "sidebar",
+      },
+    }),
     blocks: fields.blocks({
       translatable: true,
       types: {
@@ -19,11 +28,14 @@ export default defineCollection({
           heading: fields.text({ required: true }),
           body: fields.text(),
           ctaLabel: fields.text(),
-          ctaHref: fields.text(),
+          ctaHref: fields.relation({ collection: "pages" }),
         },
         text: {
           heading: fields.text(),
           content: fields.richText(),
+        },
+        youtube: {
+          url: fields.text({ required: true, admin: { component: "youtube", placeholder: "Paste a YouTube URL" } }),
         },
         faq: {
           heading: fields.text(),

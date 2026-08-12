@@ -1,26 +1,17 @@
 ---
-import { parseList } from "@/cms/core/content";
-import { cmsImage, cmsSrcset } from "@/cms/core/image";
+import { parseList } from "@/cms/core";
+import CmsPicture from "@/components/CmsPicture.astro";
 
-const { images: rawImages } = Astro.props;
-const images = parseList<string>(rawImages);
+const { image, caption, images } = Astro.props as { image?: string; caption?: string; images?: unknown };
+// `image` is the current single-image shape; fall back to the first of the legacy `images` array.
+const src = image || parseList<string>(images)[0];
 ---
 
 {
-  images.length > 0 && (
-    <section>
-      <div class="grid gap-4">
-        {images.map((src) => (
-          <img
-            src={src.startsWith("/uploads/") ? cmsImage(src, 1024) : src}
-            srcset={src.startsWith("/uploads/") ? cmsSrcset(src) : undefined}
-            sizes={src.startsWith("/uploads/") ? "(max-width: 768px) 100vw, 768px" : undefined}
-            alt=""
-            loading="lazy"
-            class="h-auto w-full rounded-lg object-cover"
-          />
-        ))}
-      </div>
-    </section>
+  src && (
+    <figure>
+      <CmsPicture src={src} alt={caption ?? ""} preset="content" loading="lazy" class="h-auto w-full rounded-lg" />
+      {caption && <figcaption class="mt-2 text-sm text-gray-500">{caption}</figcaption>}
+    </figure>
   )
 }

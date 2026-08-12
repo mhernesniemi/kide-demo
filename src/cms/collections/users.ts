@@ -1,4 +1,4 @@
-import { defineCollection, fields } from "../core/define";
+import { defineCollection, fields } from "@/cms/core";
 
 export default defineCollection({
   slug: "users",
@@ -12,7 +12,7 @@ export default defineCollection({
     name: fields.text({ required: true }),
     email: fields.email({ required: true, unique: true }),
     role: fields.select({
-      options: ["admin", "editor", "viewer"],
+      options: ["admin", "editor"],
       defaultValue: "editor",
     }),
     password: fields.text({ admin: { hidden: true } }),

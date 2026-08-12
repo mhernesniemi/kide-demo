@@ -1,59 +1,28 @@
-import { createInterface } from "node:readline";
 import { nanoid } from "nanoid";
-import { getDb, closeDb } from "./db";
+
 import { hashPassword } from "./auth";
+import { getDb } from "./runtime";
+import { getSchema } from "./schema";
 
-const rl = createInterface({ input: process.stdin, output: process.stdout });
-const ask = (q: string): Promise<string> => new Promise((resolve) => rl.question(q, (a) => resolve(a.trim())));
-
-async function main() {
-  const name = await ask("Name: ");
-  if (!name) {
-    console.error("Name is required.");
-    process.exit(1);
-  }
-
-  const email = await ask("Email: ");
-  if (!email) {
-    console.error("Email is required.");
-    process.exit(1);
-  }
-
-  const password = await ask("Password: ");
-  if (!password || password.length < 4) {
-    console.error("Password must be at least 4 characters.");
-    process.exit(1);
-  }
-
-  rl.close();
-
+export const createAdminUser = async (input: { name: string; email: string; password: string }) => {
   const db = await getDb();
-  const schema = await import("../.generated/schema");
+  const schema = getSchema();
   const tables = schema.cmsTables as Record<string, { main: any }>;
 
   if (!tables.users) {
-    console.error("No users collection found.");
-    process.exit(1);
+    throw new Error("No users collection found.");
   }
 
-  const hashed = await hashPassword(password);
   const now = new Date().toISOString();
+  const hashedPassword = await hashPassword(input.password);
 
   await db.insert(tables.users.main).values({
     _id: nanoid(),
-    name,
-    email,
-    password: hashed,
+    name: input.name,
+    email: input.email,
+    password: hashedPassword,
     role: "admin",
     _createdAt: now,
     _updatedAt: now,
   });
-
-  console.log(`Admin user "${name}" created.`);
-  closeDb();
-}
-
-main().catch((e) => {
-  console.error(e.message);
-  process.exit(1);
-});
+};

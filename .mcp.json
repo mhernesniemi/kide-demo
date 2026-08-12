@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "kide": {
+      "type": "stdio",
+      "command": "pnpm",
+      "args": [
+        "cms:mcp"
+      ]
+    }
+  }
+}
