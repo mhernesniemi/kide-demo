@@ -14,7 +14,6 @@ import {
   createSession,
   validateSession,
   destroySession,
-  getSessionUser,
   createInvite,
   validateInvite,
   consumeInvite,
@@ -49,6 +48,8 @@ import {
   clearRateLimit,
   pruneRateLimits,
 } from "@kidecms/core";
+import type { SessionUser } from "@kidecms/core";
+import { DEMO_USER } from "./demo";
 
 import * as schema from "./.generated/schema";
 import { closeDb, getDb } from "./adapters/db";
@@ -74,6 +75,10 @@ export const initCmsRuntime = () => {
 };
 
 initCmsRuntime();
+
+// Read-only demo: core's ?preview check reads the session from here rather than
+// the custom auth provider, so return the demo user too.
+const getSessionUser = async (_request: Request): Promise<SessionUser | null> => DEMO_USER;
 
 export {
   createCms,

@@ -1,4 +1,5 @@
 import { customAuth, defineConfig } from "@kidecms/core";
+import { DEMO_USER } from "./demo";
 import users from "./collections/users";
 import frontPage from "./collections/front-page";
 import pages from "./collections/pages";
@@ -19,12 +20,7 @@ export default defineConfig({
       // API calls are blocked in src/middleware.ts.
       provider: customAuth({
         kind: "custom",
-        getSession: async () => ({
-          id: "demo",
-          email: "demo@example.com",
-          name: "Demo User",
-          role: "admin",
-        }),
+        getSession: async () => DEMO_USER,
       }),
     },
   },
