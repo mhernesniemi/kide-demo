@@ -33,7 +33,7 @@
   "dependencies": {
     "@astrojs/cloudflare": "~14.1.7",
     "@astrojs/react": "^6.0.1",
-    "@kidecms/core": "^0.26.1",
+    "@kidecms/core": "^0.27.0",
     "@tailwindcss/typography": "^0.5.19",
     "@tailwindcss/vite": "^4.2.1",
     "astro": "^7.1.3",
