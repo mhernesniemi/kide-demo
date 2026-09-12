@@ -48,8 +48,11 @@ for (const photo of photos) {
       console.warn(`  ! no post with slug "${photo.post}" — skipped attach`);
       continue;
     }
+    // update() on a published document leaves the change as a pending draft
+    // (readers keep seeing the _published snapshot), so publish it too.
     await (cms as any).posts.update(post._id, { image: asset.url }, ctx);
-    console.log(`    attached to post "${photo.post}"`);
+    await (cms as any).posts.publish(post._id, ctx);
+    console.log(`    attached to post "${photo.post}" and published`);
   }
 }
 
