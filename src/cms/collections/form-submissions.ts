@@ -1,4 +1,4 @@
-import { defineCollection, fields } from "@/cms/core";
+import { defineCollection, fields } from "@kidecms/core";
 
 export default defineCollection({
   slug: "form-submissions",
@@ -6,6 +6,7 @@ export default defineCollection({
   labelField: "label",
   timestamps: true,
   admin: { group: "Library", icon: "Inbox", weight: 45 },
+  access: { create: () => false },
   views: {
     list: { columns: ["label", "form", "_createdAt", "status"] },
   },
@@ -17,7 +18,7 @@ export default defineCollection({
       defaultValue: "new",
       admin: { position: "sidebar" },
     }),
-    data: fields.json({ admin: { help: "Submitted form data (read-only)." } }),
+    data: fields.json({ access: { update: () => false }, admin: { help: "Submitted form data (read-only)." } }),
   },
   hooks: {
     beforeCreate(data) {

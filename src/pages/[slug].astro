@@ -1,0 +1,25 @@
+---
+import PublicLayout from "@/layouts/PublicLayout.astro";
+import ContentRenderer from "@/components/ContentRenderer.astro";
+import { cms } from "@/cms/.generated/api";
+import { cacheTags } from "@kidecms/core";
+
+const isPreview = Astro.url.searchParams.has("preview");
+const doc = await cms.pages.findOne({ slug: Astro.params.slug!, status: isPreview ? "any" : "published" });
+if (!doc) {
+  Astro.cache.set(false);
+  return Astro.redirect("/");
+}
+
+if (isPreview) Astro.cache.set(false);
+else Astro.cache.set({ tags: cacheTags("pages", doc._id) });
+---
+
+<PublicLayout title={doc.title} description={doc.seoDescription} cmsDoc={`pages:${doc._id}`}>
+  <article class="mx-auto max-w-5xl px-6">
+    <h1 data-cms="title" class="pt-14 pb-4 text-3xl font-semibold tracking-tight sm:text-4xl">{doc.title}</h1>
+    <div data-cms="body">
+      <ContentRenderer content={doc.body} status={isPreview ? "any" : "published"} />
+    </div>
+  </article>
+</PublicLayout>

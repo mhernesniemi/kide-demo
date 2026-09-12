@@ -1,8 +1,6 @@
 # Kide CMS
 
-A code-first CMS that lives **inside** your Astro project, not beside it.
-
-Instead of importing a CMS package, `create-kide-app` clones this repo as your project. All ~3k lines of the CMS runtime, admin UI, and routes sit in `src/cms/` where you can read, debug, and modify them. No external package boundary, no version pinning against someone else's breaking change, no abstraction you can't open up.
+A code-first CMS for Astro. Define collections in TypeScript and get a generated admin UI and typed content API.
 
 - [Live demo](https://demo.kide.dev/admin)
 - [Docs](https://docs.kide.dev/)
@@ -10,10 +8,18 @@ Instead of importing a CMS package, `create-kide-app` clones this repo as your p
 ## Quick Start
 
 ```bash
-pnpm create kide-app my-project
+pnpx create-kide-app
 ```
 
-You'll be asked for a project name, deploy target (Node.js or Cloudflare), and whether to seed demo content. The CLI clones this repo, installs, initializes git, and (for Cloudflare) provisions D1 + R2 and deploys. You end up with a running app.
+Pick how the runtime lives in your project:
+
+- **Package** - the runtime is an `@kidecms/core` npm dependency in `node_modules`. Updates are a version bump.
+- **Embedded** - the CMS runtime, admin UI, and routes sit in `src/cms/` as part of your project. Everything is there to read, debug, and change. Upgrades come as patches you review and apply yourself.
+
+Pick a deploy target:
+
+- **Node.js** - runs anywhere Node runs, SQLite for storage.
+- **Cloudflare** - deploys as a Worker; provisions D1 + R2 for you.
 
 ## How It Works
 
@@ -39,7 +45,7 @@ One config generates everything: Drizzle tables, TypeScript types, a Zod validat
 Query through the typed local API anywhere in server code:
 
 ```ts
-import { cms } from "./cms/.generated/api";
+import { cms } from "@/cms/.generated/api";
 
 const posts = await cms.posts.find({ status: "published" });
 const post = await cms.posts.create({ title: "Hello" });
@@ -57,29 +63,15 @@ posts: {
 
 ## Features
 
-- 14 field types including blocks, repeaters, and relations
+- 16 field types, including blocks and relations
 - Drafts, publishing, scheduling, versioning
-- Per-field i18n via translation tables
-- Asset management with folders, focal points, on-demand optimization
-- Tiptap rich text, block editor, real-time cross-tab live preview
-- Hierarchical taxonomies and menus
+- Per-field i18n
+- Asset management with focal points and on-demand optimization
+- Tiptap rich text, block editor, live preview
 - Role-based access control
-- Tag-based cache invalidation (Astro 7 route caching)
-- Optional AI assistant (alt text, SEO, translations)
 
-## Local MCP
-
-Kide ships a local stdio MCP server (`pnpm cms:mcp`) so agents like Claude Code and Codex can inspect collections and edit content through the same schema-aware API your server code uses — drafts by default, publishing always explicit.
-
-See the [MCP docs](https://docs.kide.dev/mcp/) for client setup (Claude Code, Codex, generic config), the access-rule actor, and safety defaults.
-
-## Deploy Targets
-
-- **Node.js**: SQLite via `better-sqlite3`, local filesystem storage.
-- **Cloudflare Workers**: D1 for the database, R2 for assets.
-
-Both are wired up by `create-kide-app`. The Cloudflare overlay lives in [`adapters/cloudflare/`](./adapters/cloudflare) and is consumed by the CLI at scaffold time. If you clone this repo directly (not via `create-kide-app`), that folder is scaffolding source and can be deleted.
+See the full feature list at [docs.kide.dev](https://docs.kide.dev/).
 
 ## Stack
 
-Astro 7, React 19, Drizzle ORM, SQLite/D1, Zod, Tiptap, shadcn/ui, Tailwind CSS v4
+Astro 7, React 19, Drizzle ORM, SQLite/D1, Zod, Tiptap, shadcn/ui, Tailwind CSS

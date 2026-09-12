@@ -5,7 +5,7 @@ import tseslint from "typescript-eslint";
 
 export default tseslint.config(
   {
-    ignores: ["dist/", ".astro/", "docs/", "packages/", "workers/", "examples/**/.astro/", "examples/**/.generated/"],
+    ignores: ["dist/", ".astro/", "docs/", "packages/", "workers/", "starters/"],
   },
   js.configs.recommended,
   ...tseslint.configs.recommended,
@@ -29,8 +29,8 @@ export default tseslint.config(
     },
   },
   {
-    // Standalone Node scripts (build/verify tooling).
-    files: ["scripts/**/*.mjs"],
+    // Standalone Node scripts (build/verify tooling, the kide CLI launcher).
+    files: ["scripts/**/*.mjs", "src/cms/internals/cli.mjs", "src/cms/internals/mcp-worker-boot.mjs"],
     languageOptions: {
       globals: {
         process: "readonly",

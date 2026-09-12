@@ -1,1 +1,1 @@
-export * from "../platform/cloudflare/database";
+export * from "@kidecms/core/platform/cloudflare/database";

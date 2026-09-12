@@ -32,13 +32,19 @@ For each source type, pick the Kide field that gives the right **admin control**
 - relations: single → `fields.relation({ collection })`; **multi-pick → `fields.relation({ collection, hasMany: true })`**
 - main body with mixed prose + components → `fields.content({ blocks: { … } })` (inline component blocks)
 - repeating rows of typed fields → `fields.json({ admin: { component: "repeater" }, itemFields: { … } })`
+  (extra keys on a row, e.g. a source id, survive editor round-trips)
 - hierarchical/per-locale reused slugs → `fields.slug({ unique: false })`
-- declare locales in `cms.config.ts` (`locales.supported`)
+- colours: `fields.color()` is palette-only — declare `admin.colors` in `cms.config.ts` and
+  snap source values onto it (an off-palette value shows as "Custom", not as a blank)
+- locales: declare them in `cms.config.ts` **and mark every translated field `translatable: true`** —
+  only those fields get a translation table; anything else passed as a translation is dropped.
+  Each document carries `_sourceLocale` (the language its base row is written in, default
+  `locales.default`), so single-language content is stored in its own language, not the default
 
 ### 3. Sync schema + regenerate the manifest
 
 ```bash
-pnpm cms:generate && pnpm cms:push        # renames/drops: RECREATE=slug1,slug2 pnpm cms:push
+pnpm cms:generate && pnpm cms:push        # renames/drops: RECREATE=slug1,slug2 pnpm cms:push --allow-data-loss
 pnpm cms:describe                         # refresh .kide/model.json + MODEL.md, then re-read it
 ```
 
@@ -67,11 +73,14 @@ const items = source.map((row) => ({
 }));
 
 const dry = await load(items, { dryRun: true }); // FIX everything it flags before the real run
+if (dry.warnings.length) console.log(JSON.stringify(dry.warnings, null, 2)); // block/repeater shape mismatches land here
 if (dry.failed) {
   console.log(JSON.stringify(dry.invalid, null, 2));
   process.exit(1);
 }
 
+// A real run throws ImportFailedError if any document fails to write (the error
+// carries the full report), so a half-applied import can never look like success.
 await load(items);
 await reindex();
 await dispose();
@@ -102,9 +111,15 @@ The hard, source-specific parts (capture once, reuse):
   (`hasMany`), ACF link objects → `fields.link()` value `{ url, label, newTab }`, image
   ids → uploaded `storagePath`. A per-block transform keeps this readable.
 - **Polylang locales:** `taxonomy=language` gives each post's locale; `taxonomy=post_translations`
-  groups translations. Collapse a group into one base (en) doc + `upsertTranslation(fi, …)`.
-- **Categories:** build a `taxonomies` doc (`slug: "categories"`, `terms: [{id,name,slug}]`)
+  groups translations. Collapse a group into one base doc + a `translations` overlay per other
+  member: store the `locales.default` member as the base when the group has one, otherwise any
+  member, and set `data._sourceLocale` to that member's language. A post that only exists in one
+  language is a base doc in that language (`_sourceLocale: "fi"`) with **no** overlay — never copy
+  it into an overlay, and never store it under a language it doesn't exist in.
+- **Categories:** build a `taxonomies` doc (`slug: "categories"`,
+  `terms: [{ id, name, slug, children: [] }]` — `children` on every term, nest WP parents there)
   and set each post's `category` to the term slug, so the admin `taxonomy-select` is populated.
+  Menus are the same tree shape: `items: [{ id, label, href, children: [] }]`.
 - **GDPR:** skip `wp_users`/employees/personal data and author links unless explicitly cleared.
 - **Published-only** (if requested): keep `post_status` in `{publish, private}`, set all
   imported docs `_status: "published"`.
@@ -116,7 +131,13 @@ The hard, source-specific parts (capture once, reuse):
 ## Pitfalls (all real, all first-try killers)
 
 - Forgetting `cms:describe` and guessing field shapes → blocks render as JSON. Read `MODEL.md`.
-- `cms:push` stalling on a rename → use `RECREATE=`.
+- `cms:push` stalling on a rename → `RECREATE=slug pnpm cms:push --allow-data-loss`.
+- `translations` for a collection with no `translatable: true` fields → `dryRun` reports it;
+  without the flag every base doc would be written and every translation refused.
+- Storing single-language content under the default locale → the admin shows the text on the wrong
+  language tab and lists claim a translation that doesn't exist. Set `_sourceLocale` instead.
+- Trusting a clean `dryRun` while ignoring `warnings` → block/repeater keys that don't match
+  the declared shape are warnings, not errors, and render as raw JSON in the editor.
 - Indexing per-doc during bulk → `_skipSearch` + one `reindex()`.
 - Re-running media without `dedupe: true` → duplicate assets.
 - Skipping `dryRun` → discovering shape mismatches in the admin instead of a report.

@@ -1,4 +1,5 @@
-import { defineCollection, fields, hasRole } from "@/cms/core";
+import { defineCollection, fields } from "@kidecms/core";
+import { pageBlockTypes } from "./page-blocks";
 
 export default defineCollection({
   slug: "pages",
@@ -9,56 +10,29 @@ export default defineCollection({
   searchable: true,
   versions: { max: 20 },
   views: {
-    list: { columns: ["title", "_status", "_updatedAt"] },
+    list: { columns: ["title", "__page", "_status", "_updatedAt"] },
   },
   fields: {
-    title: fields.text({ required: true, translatable: true }),
-    slug: fields.slug({ from: "title", translatable: true, admin: { position: "sidebar" } }),
-    summary: fields.text({
-      translatable: true,
-      admin: { rows: 3 },
-      access: { read: hasRole("admin") },
-    }),
-    image: fields.image(),
-    relatedPosts: fields.relation({ collection: "posts", hasMany: true, admin: { position: "sidebar" } }),
+    title: fields.text({ required: true }),
+    slug: fields.slug({ from: "title", admin: { position: "sidebar" } }),
     seoDescription: fields.text({
       maxLength: 160,
-      translatable: true,
       admin: { rows: 3, help: "Meta description for search engines. Max 160 characters.", position: "sidebar" },
-      access: { update: hasRole("admin") },
     }),
-    blocks: fields.blocks({
-      translatable: true,
-      types: {
-        text: {
-          heading: fields.text(),
-          content: fields.richText(),
-        },
-        image: {
-          image: fields.image(),
-          caption: fields.text({ admin: { placeholder: "Optional caption" } }),
-        },
-        youtube: {
-          url: fields.text({ required: true, admin: { component: "youtube", placeholder: "Paste a YouTube URL" } }),
-        },
-        faq: {
-          heading: fields.text(),
-          items: fields.json({
-            admin: { component: "repeater", help: "Add question and answer pairs" },
-          }),
-        },
-      },
-    }),
+    body: fields.content({ blocks: { cta: pageBlockTypes.cta, form: pageBlockTypes.form } }),
   },
   hooks: {
     afterPublish(doc, context) {
-      context.cache?.invalidate({ tags: ["pages", "home", `page:${doc._id}`] });
+      context.cache?.invalidate({ tags: ["pages", `page:${doc._id}`] });
     },
     afterUpdate(doc, context) {
       context.cache?.invalidate({ tags: ["pages", `page:${doc._id}`] });
     },
     afterDelete(doc, context) {
-      context.cache?.invalidate({ tags: ["pages", "home", `page:${doc._id}`] });
+      context.cache?.invalidate({ tags: ["pages", `page:${doc._id}`] });
+    },
+    afterUnpublish(doc, context) {
+      context.cache?.invalidate({ tags: ["pages", `page:${doc._id}`] });
     },
   },
 });

@@ -2,7 +2,7 @@
 
 Kide is a code-first CMS inside Astro (collections in `src/cms/collections/`, local SQLite in dev). If you're an agent **importing content from another CMS** (WordPress, Payload, Contentful, …), read this first — it removes the guesswork that makes migrations fail on the first try.
 
-> **Upgrading the vendored Kide core instead?** Run `pnpm cms:upgrade <target-tag>` first, then read `.kide/upgrade/<from>-to-<to>/agent-instructions.md`. The packet is agent-agnostic: use it with Codex, Claude, Cursor, or manually. Preserve project-specific collections, adapters, migrations, public pages, and custom components unless the packet shows an upstream change that clearly belongs in this client. To abandon an upgrade attempt, run `pnpm cms:restore` or preview with `pnpm cms:restore --dry-run`.
+> **Upgrading the vendored Kide core instead?** (Embedded/ejected projects only — package mode upgrades with `pnpm add @kidecms/core@latest`.) Run `pnpm cms:upgrade <target-tag>` first, then read `.kide/upgrade/<from>-to-<to>/agent-instructions.md`. The packet is agent-agnostic: use it with Codex, Claude, Cursor, or manually. Preserve project-specific collections, adapters, migrations, public pages, and custom components unless the packet shows an upstream change that clearly belongs in this client. To abandon an upgrade attempt, run `pnpm cms:restore` or preview with `pnpm cms:restore --dry-run`.
 
 ## The contract: don't reverse-engineer the codebase
 
@@ -21,7 +21,7 @@ Kide is a code-first CMS inside Astro (collections in `src/cms/collections/`, lo
 ## Golden path
 
 ```bash
-pnpm cms:generate && pnpm cms:push     # sync schema (use --recreate=slug for renames/drops)
+pnpm cms:generate && pnpm cms:push     # sync schema (renames/drops: --recreate=slug --allow-data-loss)
 node --import tsx scripts/your-import.ts   # see MIGRATING.md for the importer recipe
 pnpm cms:reindex                       # build search (or context.reindex())
 ```
@@ -31,7 +31,7 @@ pnpm cms:reindex                       # build search (or context.reindex())
 A migration script bootstraps with `createCmsContext()` and uses `load()` (validate + create):
 
 ```ts
-import { createCmsContext } from "@/cms/internals/context";
+import { createCmsContext } from "@kidecms/core/context";
 const { cms, assets, load, reindex, dispose } = await createCmsContext();
 
 // dry run first — fix everything it flags before importing for real
@@ -48,7 +48,8 @@ await dispose();
 
 ## Invariants & gotchas (these are what bite first-try)
 
-- **Schema sync is `cms:push`** (non-interactive). A column **rename/drop** can't be auto-resolved headlessly → run `RECREATE=pages,posts pnpm cms:push` (drops + recreates those tables; data loss, fine for a DB you're repopulating). The dev server also auto-pushes on boot — stop it before running scripts (SQLite single-writer).
+- **API method names:** `cms.<collection>.find / findOne / findById / create / createMany / upsert / update / delete / count / publish / unpublish / schedule / versions / restore / getTranslations / upsertTranslation`. A document's base row is written in `_sourceLocale` (defaults to `locales.default`; pass it on `create` for content that only exists in another language); `find({ locale, availability: "exact" })` lists only documents that exist in that locale. There is no `findMany` (that's Prisma/Payload) — it fails at runtime with "is not a function"; `pnpm check` catches it at the type level.
+- **Schema sync is `cms:push`** (non-interactive). A column **rename/drop** can't be auto-resolved headlessly → run `RECREATE=<slugs> pnpm cms:push` (drops + recreates those tables; data loss, fine for a DB you're repopulating). The dev server also auto-pushes on boot — stop it before running scripts (SQLite single-writer).
 - **Bulk writes:** pass `{ _system: true, _skipSearch: true }` (the default in `load()`), then `reindex()` once. Don't index per document.
 - **Wipe before re-import:** `cms.<collection>.deleteMany({}, { _system: true })`. Combine with caller-supplied `_id`s so re-runs replace, not duplicate.
 - **Slugs default `unique: true`** — set `fields.slug({ unique: false })` for hierarchical or per-locale reused slugs.

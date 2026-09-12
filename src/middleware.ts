@@ -8,9 +8,12 @@ import { defineMiddleware } from "astro:middleware";
 
 const READ_ONLY_MSG = "This is a read-only demo";
 
-const isFormRequest = (request: Request) => {
+// Native <form> submits navigate; admin components also fetch() with
+// form-encoded bodies, and a redirect there would be followed and read as success.
+const isFormNavigation = (request: Request) => {
   const ct = request.headers.get("content-type") ?? "";
-  return ct.includes("application/x-www-form-urlencoded") || ct.includes("multipart/form-data");
+  const isForm = ct.includes("application/x-www-form-urlencoded") || ct.includes("multipart/form-data");
+  return isForm && request.headers.get("sec-fetch-mode") === "navigate";
 };
 
 export const onRequest = defineMiddleware(async (context, next) => {
@@ -27,17 +30,17 @@ export const onRequest = defineMiddleware(async (context, next) => {
     return new Response(null, { status: 303, headers: { Location: "/" } });
   }
 
-  // Block all write API calls. Auth routes are exempt (harmless with the fake
-  // session); cron endpoints run as GET with their own bearer auth.
-  if (pathname.startsWith("/api/cms") && method !== "GET" && !pathname.startsWith("/api/cms/auth/")) {
+  // Block all write API calls, auth routes included (setup/invite would write
+  // users). Live preview rendering is the only read-only POST.
+  const isWrite = method !== "GET" && method !== "HEAD" && method !== "OPTIONS";
+  if (pathname.startsWith("/api/cms") && isWrite && pathname !== "/api/cms/preview/render") {
     // Form submissions → redirect back with toast
-    if (isFormRequest(context.request)) {
+    if (isFormNavigation(context.request)) {
       const referer = context.request.headers.get("referer");
       const redirectTo = referer ? new URL(referer).pathname : "/admin";
-      const sep = redirectTo.includes("?") ? "&" : "?";
       return new Response(null, {
         status: 303,
-        headers: { Location: `${redirectTo}${sep}_toast=error&_msg=${encodeURIComponent(READ_ONLY_MSG)}` },
+        headers: { Location: `${redirectTo}?_toast=error&_msg=${encodeURIComponent(READ_ONLY_MSG)}` },
       });
     }
 

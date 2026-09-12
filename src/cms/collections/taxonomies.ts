@@ -1,4 +1,4 @@
-import { defineCollection, fields } from "@/cms/core";
+import { defineCollection, fields } from "@kidecms/core";
 
 export default defineCollection({
   slug: "taxonomies",
@@ -11,7 +11,6 @@ export default defineCollection({
     name: fields.text({ required: true }),
     slug: fields.slug({ from: "name", admin: { position: "sidebar" } }),
     terms: fields.json({
-      translatable: true,
       admin: { component: "taxonomy-terms" },
     }),
   },
