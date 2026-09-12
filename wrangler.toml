@@ -4,8 +4,8 @@ compatibility_flags = ["nodejs_compat"]
 
 [[d1_databases]]
 binding = "CMS_DB"
-database_name = "kide-demo-db"
-database_id = "6f5a993d-22ff-4ae5-b9a5-f19d67608df7"
+database_name = "kide-demo-db-v26"
+database_id = "be232070-8067-46e9-8d08-adb8cdd898e5"
 migrations_dir = "src/cms/migrations"
 
 [triggers]
